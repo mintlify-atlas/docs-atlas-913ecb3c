@@ -1,0 +1,201 @@
+---
+title: "Onnx"
+description: "Loading ONNX models with the Onnx type"
+---
+
+`Onnx` is the entry point for reading `.onnx` files. It parses the model into an `InferenceModel` — a partially-typed graph where shapes and dtypes may still be unknown. You then call `.into_model()` on the `InferenceModel` to produce a fully-typed `Model` ready for optimization and execution.
+
+## Creating an Onnx instance
+
+```rust
+use tract::prelude::*;
+
+let onnx = tract::onnx()?;
+```
+
+`tract::onnx()` returns `Result<Onnx>`. It can only fail if the internal ONNX registry fails to initialize, which does not happen under normal conditions.
+
+## Loading a model
+
+### From a file
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to an `.onnx` file on disk.
+</ParamField>
+
+```rust
+let model: InferenceModel = tract::onnx()?.load("mobilenetv2-7.onnx")?;
+```
+
+### From a byte buffer
+
+<ParamField path="data" type="&[u8]" required>
+  Raw bytes of an ONNX model, for example loaded with `include_bytes!` or read from a network.
+</ParamField>
+
+```rust
+let bytes: &[u8] = include_bytes!("../assets/model.onnx");
+let model: InferenceModel = tract::onnx()?.load_buffer(bytes)?;
+```
+
+<Tip>
+  `load_buffer` is useful for embedding models in a binary so you ship a single executable.
+</Tip>
+
+## InferenceModel methods
+
+After loading you hold an `InferenceModel`. The following methods let you inspect it and, optionally, constrain its inputs before converting to a typed model.
+
+### Inspecting inputs and outputs
+
+```rust
+let n_in  = model.input_count()?;   // usize
+let n_out = model.output_count()?;  // usize
+
+let first_input_name  = model.input_name(0)?;   // String
+let first_output_name = model.output_name(0)?;  // String
+
+let input_fact  = model.input_fact(0)?;   // InferenceFact
+let output_fact = model.output_fact(0)?;  // InferenceFact
+```
+
+### Setting input facts
+
+For models with dynamic shapes (symbolic or unknown dimensions) you must tell tract the concrete shape and dtype before calling `into_model`.
+
+<ParamField path="id" type="usize" required>
+  Zero-based input index.
+</ParamField>
+
+<ParamField path="fact" type="impl AsFact" required>
+  An `InferenceFact`, or a fact spec string such as `"1,3,224,224,f32"`.
+</ParamField>
+
+```rust
+// Set input 0 to a fixed 1×3×224×224 f32 tensor
+model.set_input_fact(0, "1,3,224,224,f32")?;
+
+// Set output 0 to an unspecified fact (let tract infer it)
+model.set_output_fact(0, InferenceFact::empty()?)?;
+```
+
+Fact spec string format: comma-separated dims followed by the dtype token.
+Supported dtype tokens: `bool`, `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f16`, `f32`, `f64`.
+
+### Running shape inference
+
+```rust
+model.analyse()?;
+```
+
+`analyse` propagates shape and dtype information through the graph. `into_model` calls this internally, so explicit calls are only needed when you want to inspect inferred facts before converting.
+
+### Converting to a typed model
+
+```rust
+let typed: Model = model.into_model()?;
+```
+
+`into_model` calls `analyse` if needed, then converts the inference graph to a fully typed, decluttered `Model`. This step is irreversible — the `InferenceModel` is consumed.
+
+## Examples
+
+<CodeGroup>
+
+```rust Basic load and run
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let model = tract::onnx()?
+        .load("mobilenetv2-7.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+
+    let outputs = model.run([input])?;
+    println!("output: {:?}", outputs[0].shape()?);
+    Ok(())
+}
+```
+
+```rust Dynamic shapes
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    // The model uses a symbolic batch dimension.
+    // Fix it to 1 before converting.
+    let mut inference_model = tract::onnx()?.load("model.onnx")?;
+    inference_model.set_input_fact(0, "1,3,224,224,f32")?;
+
+    let model = inference_model.into_model()?.into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+    let outputs = model.run([input])?;
+    println!("scores: {:?}", outputs[0].as_slice::<f32>()?);
+    Ok(())
+}
+```
+
+```rust Load from bytes (embedded)
+use tract::prelude::*;
+
+static MODEL_BYTES: &[u8] = include_bytes!("../assets/model.onnx");
+
+fn main() -> anyhow::Result<()> {
+    let model = tract::onnx()?
+        .load_buffer(MODEL_BYTES)?
+        .into_model()?
+        .into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+    let outputs = model.run([input])?;
+    println!("output: {:?}", outputs[0].shape()?);
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+## MobileNet v2 — full example
+
+The following is adapted directly from the `onnx-mobilenet-v2` example in the tract repository. It shows image pre-processing, tensor construction via `tract_ndarray`, and reading the output.
+
+```rust
+use anyhow::Result;
+use tract::prelude::*;
+
+fn main() -> Result<()> {
+    let model = tract::onnx()?
+        .load("mobilenetv2-7.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    let image = image::open("grace_hopper.jpg").unwrap().to_rgb8();
+    let resized = image::imageops::resize(
+        &image, 224, 224,
+        image::imageops::FilterType::Triangle,
+    );
+
+    // Normalize to ImageNet mean/std and pack into a (1, 3, 224, 224) tensor
+    let input = tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
+        let mean = [0.485, 0.456, 0.406][c];
+        let std  = [0.229, 0.224, 0.225][c];
+        (resized[(x as _, y as _)][c] as f32 / 255.0 - mean) / std
+    });
+
+    let result = model.run([input])?;
+
+    // Find the class with the highest score
+    let best = result[0]
+        .as_slice::<f32>()?
+        .iter()
+        .zip(2..)
+        .max_by(|a, b| a.0.partial_cmp(b.0).unwrap());
+    println!("result: {best:?}");
+    Ok(())
+}
+```

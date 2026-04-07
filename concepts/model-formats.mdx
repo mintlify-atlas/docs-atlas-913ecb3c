@@ -1,0 +1,290 @@
+---
+title: "Model formats"
+description: "Supported model formats: ONNX, TensorFlow, NNEF, and tract-OPL"
+---
+
+tract can load models from four source formats. The right choice depends on where your model comes from and whether you are in development or production deployment.
+
+<CardGroup cols={2}>
+  <Card title="ONNX" icon="file-code">
+    Best coverage (~85%), widest ecosystem support. Recommended for most new projects.
+  </Card>
+  <Card title="TensorFlow 1.x" icon="file-code">
+    Frozen `.pb` models. For TF2, convert to ONNX first.
+  </Card>
+  <Card title="NNEF / tract-OPL" icon="file-archive">
+    Production format. Smaller runtime, faster startup. Convert from ONNX/TF once.
+  </Card>
+  <Card title="TFLite" icon="file-code">
+    Basic `.tflite` FlatBuffer support via `tract-tflite`.
+  </Card>
+</CardGroup>
+
+---
+
+<Tabs>
+  <Tab title="ONNX">
+    ## ONNX
+
+    ONNX is the primary format for loading models trained with PyTorch, Keras, or any other framework that supports ONNX export.
+
+    ### Loading an ONNX model
+
+    ```rust
+    use tract::prelude::*;
+
+    let model = onnx()?
+        .load("model.onnx")?        // returns InferenceModel
+        .into_model()?              // type inference + declutter → TypedModel
+        .into_runnable()?;          // optimize and prepare for execution
+    ```
+
+    To load from an in-memory buffer instead of a file path:
+
+    ```rust
+    let bytes: &[u8] = include_bytes!("model.onnx");
+    let model = onnx()?.load_buffer(bytes)?.into_model()?.into_runnable()?;
+    ```
+
+    ### Supported opsets
+
+    tract tests ONNX operators from **opset 9** (ONNX 1.4.1) through **opset 18** (ONNX 1.13.0). Approximately **85%** of ONNX backend tests pass.
+
+    All "real life" integration tests in the ONNX test suite pass:
+
+    > `bvlc_alexnet`, `densenet121`, `inception_v1`, `inception_v2`, `resnet50`, `shufflenet`, `squeezenet`, `vgg19`, `zfnet512`
+
+    ### Supported operators
+
+    A representative selection of commonly used operators:
+
+    <AccordionGroup>
+      <Accordion title="Convolution and linear layers">
+        `Conv`, `ConvInteger`, `ConvTranspose`, `DepthToSpace`, `SpaceToDepth`, `Gemm`, `MatMul`, `MatMulInteger`, `QLinearConv`, `QLinearMatMul`, `Einsum`
+      </Accordion>
+      <Accordion title="Recurrent layers">
+        `LSTM`, `GRU`, `RNN`, `Scan`
+      </Accordion>
+      <Accordion title="Normalization and activation">
+        `BatchNormalization`, `InstanceNormalization`, `LRN`, `Relu`, `LeakyRelu`, `PRelu`, `Elu`, `Selu`, `HardSigmoid`, `Sigmoid`, `Tanh`, `Softmax`, `LogSoftmax`, `Softplus`, `Softsign`
+      </Accordion>
+      <Accordion title="Pooling">
+        `AveragePool`, `MaxPool`, `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool`
+      </Accordion>
+      <Accordion title="Shape manipulation">
+        `Reshape`, `Flatten`, `Transpose`, `Squeeze`, `Unsqueeze`, `Expand`, `Tile`, `Concat`, `Split`, `Slice`, `Gather`, `GatherElements`, `GatherND`, `Scatter`, `ScatterElements`, `ScatterND`, `Pad`
+      </Accordion>
+      <Accordion title="Arithmetic and math">
+        `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Sqrt`, `Rsqrt`, `Abs`, `Neg`, `Exp`, `Log`, `Ceil`, `Floor`, `Round`, `Clip`, `Mod`, `CumSum`, `Reciprocal`
+      </Accordion>
+      <Accordion title="Reduction">
+        `ReduceSum`, `ReduceMean`, `ReduceMax`, `ReduceMin`, `ReduceProd`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, `ReduceLogSumExp`, `ReduceSumSquare`, `ArgMax`, `ArgMin`
+      </Accordion>
+      <Accordion title="Quantization">
+        `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear`, `ConvInteger`, `MatMulInteger`
+      </Accordion>
+      <Accordion title="Signal processing">
+        `DFT`, `STFT`, `BlackmanWindow`, `HammingWindow`, `HannWindow`, `MelWeightMatrix`
+      </Accordion>
+      <Accordion title="Comparison and logic">
+        `Equal`, `Greater`, `GreaterOrEqual`, `Less`, `LessOrEqual`, `And`, `Or`, `Not`, `Xor`, `Where`, `IsNaN`, `IsInf`
+      </Accordion>
+      <Accordion title="Other">
+        `Shape`, `Size`, `Range`, `OneHot`, `NonZero`, `NonMaxSuppression`, `If`, `Compress`, `Resize`, `TreeEnsembleClassifier`, `CategoryMapper`, `Cast`, `CastLike`, `Identity`, `Dropout`, `Constant`, `ConstantOfShape`
+      </Accordion>
+    </AccordionGroup>
+
+    <Info>
+      The full list includes over 150 operators. See the [README](https://github.com/snipsco/tract) for the exhaustive enumeration.
+    </Info>
+
+    ### What is NOT supported
+
+    <Warning>
+      The following categories are structurally unsupported and unlikely to be added:
+
+      - **Tensor Sequences** — tract's execution model is strictly tensor-in / tensor-out. Sequence types would require significant architectural changes.
+      - **Optional Tensors** — same structural constraint.
+
+      Some operators with complex internal logic (e.g., certain `Resize` variants) have incomplete or partial support. Contributions are welcome.
+    </Warning>
+  </Tab>
+
+  <Tab title="TensorFlow">
+    ## TensorFlow
+
+    tract supports **TensorFlow 1.x frozen models** (`.pb` files). These are models exported with `tf.Session` and `graph_util.convert_variables_to_constants`.
+
+    ### Loading a TF1 frozen model
+
+    ```rust
+    use tract::prelude::*;
+    // tract-tensorflow is pulled in transitively via the tract facade crate.
+    // Use the CLI for loading TF models directly in application code:
+    // (TF support is primarily exercised via the tract CLI)
+    ```
+
+    <Note>
+      Direct TF model loading via the Rust API requires depending on `tract-tensorflow` explicitly. The recommended path for TF2 models is to convert to ONNX first, then use `onnx().load(...)`.
+    </Note>
+
+    ### TF2 models
+
+    TensorFlow 2 models are not directly supported. Convert them to ONNX using `tf2onnx` or export from Keras, then load with `tract-onnx`.
+
+    ```bash
+    # Convert TF2 SavedModel to ONNX
+    python -m tf2onnx.convert --saved-model ./my_model --output model.onnx
+    ```
+
+    ### Supported TF1 operators
+
+    A representative selection:
+
+    | Category | Operators |
+    |---|---|
+    | Convolution | `Conv2D`, `DepthwiseConv2dNative` |
+    | Linear | `MatMul`, `BiasAdd` |
+    | Recurrent | `BlockLSTM` |
+    | Normalization | `FusedBatchNorm`, `FakeQuantWithMinMaxVars` |
+    | Pooling | `AvgPool`, `MaxPool` |
+    | Activation | `Relu`, `Relu6`, `Sigmoid`, `Tanh`, `Softmax` |
+    | Shape ops | `Reshape`, `Transpose`, `Squeeze`, `ExpandDims`, `Pack`, `Slice`, `StridedSlice` |
+    | Arithmetic | `Add`, `AddN`, `AddV2`, `Sub`, `Mul`, `RealDiv`, `Pow`, `Rsqrt`, `Neg`, `Abs`, `Log`, `Ceil` |
+    | Reduction | `Mean`, `Sum`, `Prod`, `Max`, `Min` |
+    | Control flow | `Merge`, `Switch`, `Enter`, `Exit`, `LoopCond` |
+    | Utility | `Const`, `Placeholder`, `Identity`, `Cast`, `Shape`, `Fill`, `Range`, `Tile` |
+
+    The full list of supported TF1 operators is in the [README](https://github.com/snipsco/tract#note-support-for-tensorflow-1x).
+  </Tab>
+
+  <Tab title="NNEF">
+    ## NNEF
+
+    NNEF (Neural Network Exchange Format) is a specification designed for inference — the production counterpart to ONNX. Because its operator semantics align closely with what tract-core needs, loading an NNEF model is much faster and lighter than loading from ONNX or TensorFlow.
+
+    ### Loading an NNEF model
+
+    ```rust
+    use tract::prelude::*;
+
+    // From a .nnef.tar.gz archive
+    let model = nnef()?.load("model.nnef.tar.gz")?.into_runnable()?;
+
+    // From a directory (uncompressed NNEF)
+    let model = nnef()?.load("model.nnef/")?. into_runnable()?;
+    ```
+
+    ### Creating an NNEF archive from an ONNX model
+
+    ```bash
+    # Using the tract CLI (install with: cargo install tract)
+    tract model.onnx dump --nnef model.nnef.tar.gz
+    ```
+
+    Or programmatically:
+
+    ```rust
+    use tract::prelude::*;
+
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    let nnef_framework = nnef()?;
+    nnef_framework.write_model_to_tar_gz("model.nnef.tar.gz", &typed_model)?;
+    ```
+
+    ### What tract supports vs. what is missing
+
+    | Category | Status |
+    |---|---|
+    | Core NNEF operators | Supported |
+    | ROI operators (`roi_pooling`, `roi_align`) | Not supported |
+    | NNEF quantization operators | Partial / not fully supported |
+    | tract-OPL extensions | Supported (see tract-OPL tab) |
+
+    <Tip>
+      If your model uses operators not covered by base NNEF, use tract-OPL (which extends NNEF) rather than bare NNEF. The tract CLI automatically emits tract-OPL extensions when needed.
+    </Tip>
+  </Tab>
+
+  <Tab title="tract-OPL">
+    ## tract-OPL
+
+    tract-OPL is tract's native production format. It is a superset of NNEF: every valid NNEF model is a valid tract-OPL model, and tract-OPL adds proprietary extensions for operators not in the NNEF spec.
+
+    ### Why tract-OPL?
+
+    The heavy work of converting a training-framework model (ONNX, TF) into tract's internal representation — parsing, shape inference, operator mapping, graph decluttering — happens once at conversion time. The resulting tract-OPL archive encodes the model in a form that is close to what tract-core needs at runtime. Loading it is significantly faster and requires a much smaller runtime binary.
+
+    ```
+    Development:  onnx/tf model → [tract CLI] → .nnef.tar.gz (tract-OPL)
+    Production:   .nnef.tar.gz → nnef().load() → into_runnable() → run()
+    ```
+
+    ### Extensions over base NNEF
+
+    | Extension | Crate | Purpose |
+    |---|---|---|
+    | `tract_core` ops | `tract-nnef` | Operators in tract-core with no NNEF equivalent |
+    | ONNX ops | `tract-onnx-opl` | ONNX operators not mappable to tract-core |
+    | Pulse ops | `tract-pulse-opl` | Streaming/pulsing operators for real-time inference |
+    | Scan / recurrent | `tract-onnx-opl` | Recurrent network support |
+    | Symbolic dims | `tract-nnef` | Dynamic batch / sequence dimensions |
+
+    Enabling extensions when loading:
+
+    ```rust
+    use tract::prelude::*;
+
+    let mut framework = nnef()?;
+    framework.enable_tract_core()?;
+    framework.enable_onnx()?;      // if model uses ONNX-specific ops
+    framework.enable_pulse()?;     // if model is a streaming model
+
+    let model = framework.load("model.nnef.tar.gz")?.into_runnable()?;
+    ```
+
+    ### Version compatibility rules
+
+    <Warning>
+      tract-OPL stability follows this rule:
+
+      **Models serialized with `tract 0.x.y` are guaranteed to load with `tract 0.x.z` where `z ≥ y`.**
+
+      Cross-minor-version compatibility is not guaranteed. Known breaking changes:
+      - `0.16.3` — Scan operator (forward-compatible only)
+      - `0.17.0` — Binary decision tree classifier
+
+      Since `0.17.0`, every tract-OPL file embeds a `tract_nnef_ser_version` property. Compatibility checking is the application's responsibility; tract does not enforce it.
+    </Warning>
+
+    The `tract_nnef_format_version` property is also present: pre-`0.17.0` files set it to `alpha1`; `0.17.0`+ files set it to `beta1`.
+  </Tab>
+
+  <Tab title="TFLite">
+    ## TFLite
+
+    Basic TFLite FlatBuffer (`.tflite`) model support is provided by `tract-tflite`.
+
+    <Warning>
+      TFLite support is less complete than ONNX or TF1 support. It is suitable for simple quantized MobileNet-class models but may not cover all operators needed for complex architectures.
+    </Warning>
+
+    ### Loading a TFLite model
+
+    ```rust
+    // tract-tflite is available via the tract workspace but is not re-exported
+    // by the tract facade crate by default. Add it as a direct dependency:
+    // [dependencies]
+    // tract-tflite = "0.23"
+    ```
+
+    ```bash
+    # Via the tract CLI:
+    tract model.tflite dump
+    tract model.tflite bench
+    ```
+
+    For production use, consider converting the TFLite model to ONNX using `onnx-tf` or similar tooling, then loading with `tract-onnx`.
+  </Tab>
+</Tabs>

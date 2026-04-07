@@ -1,0 +1,148 @@
+---
+title: "Tensor, Fact, and DatumType"
+description: "Working with tensors, facts, and data types in the tract Rust API"
+---
+
+## Tensor
+
+`Tensor` is the fundamental data container in tract. It wraps a multi-dimensional array with a concrete element type (DatumType) and shape.
+
+### Creating tensors
+
+The most common way to create a `Tensor` is from an `ndarray` array, which is re-exported as `tract_ndarray`:
+
+```rust
+use tract::prelude::*;
+
+// Create a 1×3×224×224 f32 tensor
+let array = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224));
+let tensor: Tensor = array.into();
+```
+
+You can also create a tensor from raw bytes:
+
+```rust
+let dt = DatumType::F32;
+let shape = &[1usize, 3, 224, 224];
+let data: &[u8] = /* raw bytes */;
+let tensor = Tensor::from_bytes(dt, shape, data)?;
+```
+
+### Reading tensor data
+
+```rust
+// As a typed slice (from the internal tensor via run output)
+let values: &[f32] = result[0].as_slice::<f32>()?;
+
+// As raw bytes (from TensorInterface)
+let (dt, shape, bytes) = tensor.as_bytes()?;
+```
+
+### Converting between types
+
+```rust
+let f16_tensor = tensor.convert_to(DatumType::F16)?;
+```
+
+### Tensor methods
+
+| Method | Description |
+|--------|-------------|
+| `Tensor::from_bytes(dt, shape, data)` | Create from raw byte slice |
+| `as_bytes()` | Returns `(DatumType, &[usize], &[u8])` |
+| `datum_type()` | Returns the element `DatumType` |
+| `convert_to(dt)` | Cast to another datum type |
+
+---
+
+## DatumType
+
+`DatumType` enumerates the supported element types:
+
+| Variant | Rust type | Description |
+|---------|-----------|-------------|
+| `DatumType::Bool` | `bool` | Boolean |
+| `DatumType::U8` | `u8` | Unsigned 8-bit |
+| `DatumType::U16` | `u16` | Unsigned 16-bit |
+| `DatumType::U32` | `u32` | Unsigned 32-bit |
+| `DatumType::U64` | `u64` | Unsigned 64-bit |
+| `DatumType::I8` | `i8` | Signed 8-bit |
+| `DatumType::I16` | `i16` | Signed 16-bit |
+| `DatumType::I32` | `i32` | Signed 32-bit |
+| `DatumType::I64` | `i64` | Signed 64-bit |
+| `DatumType::F16` | `half::f16` | 16-bit float |
+| `DatumType::F32` | `f32` | 32-bit float |
+| `DatumType::F64` | `f64` | 64-bit float |
+
+---
+
+## Fact
+
+`Fact` describes the shape and dtype of a typed model's input or output. You get facts from `Model::input_fact()` or `Model::output_fact()`.
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `datum_type()` | Element type |
+| `rank()` | Number of dimensions |
+| `dim(axis)` | Returns a `Dim` for the given axis |
+
+The display format is `"1,3,224,224,f32"` (dimensions followed by dtype).
+
+### Fact spec strings
+
+You can parse a fact from a string:
+
+```rust
+let fact = model.parse_fact("1,3,224,224,f32")?;
+```
+
+Or pass a string directly when setting input facts — tract converts it automatically via `AsFact`:
+
+```rust
+model.set_input_fact(0, "1,3,224,224,f32")?;
+```
+
+---
+
+## InferenceFact
+
+`InferenceFact` is a partial fact used with `InferenceModel` (ONNX/TF before type inference). Dimensions and dtype may be unknown.
+
+```rust
+// Fully specified
+inference_model.set_input_fact(0, "1,3,224,224,f32")?;
+
+// Empty (completely unknown)
+let empty = InferenceFact::empty()?;
+inference_model.set_input_fact(0, empty)?;
+```
+
+---
+
+## Dim
+
+`Dim` represents a single axis size, which may be symbolic (e.g., a variable-length sequence) or concrete.
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `to_int64()` | Extract as `i64`; errors if symbolic |
+| `eval([(name, value)])` | Evaluate a symbolic dim with given values |
+
+```rust
+let dim = model.input_fact(0)?.dim(1)?;
+
+// If concrete:
+let size: i64 = dim.to_int64()?;
+
+// If symbolic (e.g., sequence length "S"):
+let resolved = dim.eval([("S", 128)])?;
+let size = resolved.to_int64()?;
+```
+
+<Note>
+Symbolic dimensions appear when a model has variable-length inputs. Use `ConcretizeSymbols` transform or `eval()` to resolve them before running.
+</Note>

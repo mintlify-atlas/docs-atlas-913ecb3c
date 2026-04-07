@@ -1,0 +1,196 @@
+---
+title: "Python: Tensor, Fact, and DatumType"
+description: "Working with tensors and data types in Python"
+---
+
+`Tensor` is the fundamental data carrier in tract. It flows in and out of models: you supply inputs as numpy arrays (or `Tensor` objects directly) and receive outputs as `Tensor` objects that you convert back to numpy. `Fact` and `InferenceFact` describe the shape and element type of a tensor slot in a model.
+
+---
+
+## DatumType
+
+`DatumType` is an `IntEnum` that identifies the element type of a tensor.
+
+| Name | Description |
+|---|---|
+| `DatumType.BOOL` | Boolean |
+| `DatumType.U8` | Unsigned 8-bit integer |
+| `DatumType.U16` | Unsigned 16-bit integer |
+| `DatumType.U32` | Unsigned 32-bit integer |
+| `DatumType.U64` | Unsigned 64-bit integer |
+| `DatumType.I8` | Signed 8-bit integer |
+| `DatumType.I16` | Signed 16-bit integer |
+| `DatumType.I32` | Signed 32-bit integer |
+| `DatumType.I64` | Signed 64-bit integer |
+| `DatumType.F16` | 16-bit float (half precision) |
+| `DatumType.F32` | 32-bit float (single precision) |
+| `DatumType.F64` | 64-bit float (double precision) |
+
+Complex variants (`COMPLEX_I16`, `COMPLEX_I32`, `COMPLEX_I64`, `COMPLEX_F16`, `COMPLEX_F32`, `COMPLEX_F64`) are also available for signal-processing use cases.
+
+### Helper predicates
+
+```python
+dt = DatumType.F32
+dt.is_float()    # True
+dt.is_signed()   # False
+dt.is_unsigned() # False
+dt.is_bool()     # False
+dt.is_number()   # True
+```
+
+---
+
+## Tensor
+
+### Creating tensors
+
+<CodeGroup>
+```python From numpy (automatic)
+import numpy
+
+# Pass numpy arrays directly to run() — conversion is automatic
+outputs = runnable.run([numpy.zeros((1, 3, 224, 224), dtype=numpy.float32)])
+```
+
+```python From numpy (explicit)
+import numpy
+from tract import Tensor
+
+array = numpy.zeros((1, 3, 224, 224), dtype=numpy.float32)
+tensor = Tensor.from_numpy(array)
+```
+
+```python From raw bytes
+from tract import Tensor, DatumType
+
+shape = (1, 3, 224, 224)
+data = bytes(1 * 3 * 224 * 224 * 4)  # 4 bytes per f32
+tensor = Tensor.from_bytes(DatumType.F32, shape, data)
+```
+</CodeGroup>
+
+### Converting to numpy
+
+```python
+Tensor.to_numpy() -> numpy.ndarray
+```
+
+Copy the tensor data into a numpy array. The `Tensor` remains valid after the call.
+
+```python
+result_array = outputs[0].to_numpy()
+```
+
+`into_numpy()` is an alternative that destroys the tensor after converting, freeing the native memory immediately.
+
+### Inspecting a tensor
+
+```python
+Tensor.datum_type() -> DatumType
+```
+
+Return the element type of the tensor.
+
+### Reading raw bytes
+
+```python
+Tensor.as_bytes() -> Tuple[DatumType, tuple, bytes]
+```
+
+Return a `(datum_type, shape, data)` tuple. `data` is a bytes-like object pointing to the tensor's native memory — copy it if you need to keep it beyond the tensor's lifetime.
+
+### Converting element type
+
+```python
+Tensor.convert_to(to: DatumType) -> Tensor
+```
+
+Return a new tensor with a different element type. If the source and destination types are the same, a shallow clone is returned cheaply.
+
+---
+
+## Fact
+
+`Fact` describes a tensor slot in a typed `Model` or `Runnable`. It always carries the full shape (possibly with symbolic dimensions) and element type.
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `datum_type()` | `DatumType` | Element type |
+| `rank()` | `int` | Number of axes |
+| `dim(axis: int)` | `Dim` | Size of the given axis |
+| `dims()` | `List[Dim]` | Sizes of all axes |
+| `__str__()` | `str` | Human-readable spec, e.g. `"1,3,224,224,f32"` |
+
+```python
+fact = model.input_fact(0)
+print(fact)           # "1,3,224,224,f32"
+print(fact.rank())    # 4
+print(fact.dim(2))    # 224
+```
+
+---
+
+## InferenceFact
+
+`InferenceFact` describes a tensor slot in an `InferenceModel`. It may be partially unknown — dimensions and even the element type can be absent.
+
+`InferenceFact` objects are obtained from `InferenceModel.input_fact()` / `output_fact()`, or parsed from a spec string via `InferenceModel.set_input_fact()`.
+
+```python
+# Read the current (possibly partial) input fact
+fact = inference_model.input_fact(0)
+print(fact)   # may be empty or partial
+
+# Set a concrete fact from a spec string
+inference_model.set_input_fact(0, "1,3,224,224,f32")
+```
+
+---
+
+## Dim
+
+`Dim` represents a single dimension of a tensor, which may be a concrete integer or a symbolic expression.
+
+| Method | Returns | Description |
+|---|---|---|
+| `to_i64()` | `int` | Convert to an integer (raises if symbolic) |
+| `eval(values: dict)` | `Dim` | Evaluate symbolic dim with given symbol values |
+| `__str__()` | `str` | String representation (e.g. `"224"` or `"N"`) |
+
+```python
+fact = model.input_fact(0)
+dim0 = fact.dim(0)
+
+# If fully concrete:
+n = dim0.to_i64()   # 1
+
+# If symbolic (e.g. "N"):
+resolved = dim0.eval({"N": 4})
+print(resolved.to_i64())   # 4
+```
+
+<Info>
+Symbolic dimensions are common when a model was exported with a variable batch size. Use `ConcretizeSymbols` or `Dim.eval()` to resolve them before inference.
+</Info>
+
+---
+
+## Fact spec string format
+
+Both `Fact.__str__()` and the fact-setting APIs use the same compact string format:
+
+```
+dim0,dim1,...,dimN,dtype
+```
+
+Examples:
+
+| Spec | Shape | Type |
+|---|---|---|
+| `"1,3,224,224,f32"` | `[1, 3, 224, 224]` | float32 |
+| `"B,128,f16"` | `[B, 128]` (B symbolic) | float16 |
+| `"1000,f32"` | `[1000]` | float32 |
+| `"1,i64"` | `[1]` | int64 |

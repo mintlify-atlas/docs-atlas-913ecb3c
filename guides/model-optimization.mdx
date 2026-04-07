@@ -1,0 +1,197 @@
+---
+title: "Model optimization"
+description: "Apply transforms, precision changes, and cost analysis to tract models."
+---
+
+tract separates **model loading** from **model optimization**. This lets you inspect, transform, and serialize a model before committing it to a fixed execution plan — useful for both offline model preparation and dynamic adaptation at startup.
+
+## The optimization pipeline
+
+When you call `into_runnable()` on a `Model`, tract runs:
+
+1. **Declutter** — removes training artefacts, fuses redundant ops, simplifies the graph
+2. **Optimize** — selects the best kernel implementations for the current CPU (SIMD, memory layout, fused patterns)
+3. **Plan compilation** — linearizes the graph into a `TypedSimplePlan` ready for execution
+
+You can intervene between steps 1 and 2 by applying `Model::transform()` calls before `into_runnable()`.
+
+## Available transforms
+
+### ConcretizeSymbols
+
+Replaces symbolic dimensions (e.g. `N`, `batch`, `S`) with concrete integer values, unlocking further optimization opportunities that are only available when shapes are fully known.
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let mut model = tract::onnx()?
+        .load("bert.onnx")?
+        .into_model()?;
+
+    model.transform(ConcretizeSymbols::new().value("batch", 1).value("S", 128))?;
+    let runnable = model.into_runnable()?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+
+    model = tract.onnx().load("bert.onnx").into_model()
+    model.transform(tract.ConcretizeSymbols({"batch": 1, "S": 128}))
+    runnable = model.into_runnable()
+    ```
+  </Tab>
+</Tabs>
+
+### FloatPrecision
+
+Translates float operations from one precision to another. The most common use is **f32 → f16** for faster inference on ARM processors with native f16 support.
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let mut model = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?;
+
+    // Downcast all f32 ops to f16
+    model.transform(FloatPrecision::new(DatumType::F32, DatumType::F16))?;
+    let runnable = model.into_runnable()?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+    from tract import DatumType
+
+    model = tract.onnx().load("model.onnx").into_model()
+    model.transform(tract.FloatPrecision(DatumType.F32, DatumType.F16))
+    runnable = model.into_runnable()
+    ```
+
+    To exclude specific layers:
+
+    ```python
+    model.transform(
+        tract.FloatPrecision(DatumType.F32, DatumType.F16, exclude=["output_projection"])
+    )
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  f16 inference may reduce output accuracy. Validate model outputs after applying this transform, especially for models sensitive to numerical precision (e.g. language models, quantized activations).
+</Warning>
+
+### Pulse
+
+Converts a batch model to a streaming (pulse) model. See the [Streaming inference guide](/guides/streaming-pulse) for full details.
+
+```rust
+use tract::prelude::*;
+
+let mut model = tract::onnx()?.load("audio_model.onnx")?.into_model()?;
+model.transform(Pulse::new("512").symbol("S"))?;
+let runnable = model.into_runnable()?;
+```
+
+### UnfoldKeyValueCacheTransform
+
+Activates KV-cache mode for autoregressive language models, unrolling the attention mechanism to maintain a growing key-value cache across decoding steps. Enabled via the string name `"unfold-kv-cache"`.
+
+```rust
+use tract::prelude::*;
+
+let mut model = tract::onnx()?.load("llm.onnx")?.into_model()?;
+model.transform("unfold-kv-cache")?;
+let runnable = model.into_runnable()?;
+```
+
+## Saving optimized models
+
+After applying transforms, serialize the model to NNEF for fast startup in production. See the [NNEF workflow guide](/guides/nnef-workflow) for full details.
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let mut nnef = tract::nnef()?;
+    nnef.enable_tract_core()?;
+
+    let mut model = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?;
+
+    // Apply any transforms
+    model.transform(FloatPrecision::new(DatumType::F32, DatumType::F16))?;
+
+    // Serialize — this model loads fast at startup
+    nnef.write_model_to_tar_gz("model_f16.nnef.tgz", &model)?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+    from tract import DatumType
+
+    model = tract.onnx().load("model.onnx").into_model()
+    model.transform(tract.FloatPrecision(DatumType.F32, DatumType.F16))
+
+    nnef = tract.nnef().with_tract_core()
+    nnef.write_model_to_tar_gz(model, "model_f16.nnef.tgz")
+    ```
+  </Tab>
+</Tabs>
+
+## Quantization
+
+<Info>
+  Q4_0 quantization for LLM weights is experimentally supported. It reduces memory bandwidth and can improve throughput on memory-bound workloads. The API stabilization is ongoing — check the [tract releases](https://github.com/sonos/tract/releases) for the latest status.
+</Info>
+
+## Cost analysis and profiling
+
+`Runnable.cost_json()` returns a JSON document with per-operator FLOPs estimates. `profile_json(inputs)` additionally runs the model and records wall-clock time per operator.
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let runnable = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    // Static cost estimate (no inputs needed)
+    let cost = runnable.cost_json()?;
+    println!("{cost}");
+
+    // Dynamic profiling with real inputs
+    let input = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224));
+    let profile = runnable.profile_json(Some([input]))?;
+    println!("{profile}");
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract, json, numpy
+
+    runnable = tract.onnx().load("model.onnx").into_model().into_runnable()
+
+    # Static cost
+    cost = json.loads(runnable.profile_json(None))
+
+    # Dynamic profile
+    input = numpy.zeros((1, 3, 224, 224), dtype=numpy.float32)
+    profile = json.loads(runnable.profile_json([input]))
+    ```
+  </Tab>
+</Tabs>
+
+The JSON output lists each operator node with its estimated FLOP count and, when profiled, its measured execution time. Use it to identify bottlenecks before choosing which transforms or precision changes to apply.

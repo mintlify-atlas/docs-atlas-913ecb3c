@@ -1,0 +1,147 @@
+---
+title: "Python: Nnef"
+description: "Loading and saving NNEF models in Python"
+---
+
+NNEF (Neural Network Exchange Format) is a model interchange format focused on inference rather than training. tract can load standard NNEF models and also save models in `tract-opl`, a set of proprietary NNEF extensions that covers most of what tract can represent.
+
+The primary use case is **model pre-cooking**: convert an ONNX model offline, serialize it as NNEF, and load the cheaper NNEF form at runtime.
+
+## Creating a Nnef context
+
+```python
+import tract
+
+nnef = tract.nnef()
+```
+
+Call `with_*()` methods on the context to enable optional operator-set extensions before loading or saving.
+
+---
+
+## Loading models
+
+### `load`
+
+```python
+Nnef.load(path: str) -> Model
+```
+
+Load an NNEF model from a file, directory, `.tar`, or `.tar.gz` archive.
+
+```python
+model = tract.nnef().load("mobilenet_v2_1.0.onnx.nnef.tgz").into_runnable()
+```
+
+---
+
+## Saving models
+
+All three write methods accept a `Model` and a destination path. The `Model` is not consumed.
+
+### `write_model_to_dir`
+
+```python
+Nnef.write_model_to_dir(model: Model, path: str) -> None
+```
+
+Write the model as an uncompressed NNEF directory structure.
+
+### `write_model_to_tar`
+
+```python
+Nnef.write_model_to_tar(model: Model, path: str) -> None
+```
+
+Write the model as an uncompressed `.tar` archive.
+
+### `write_model_to_tar_gz`
+
+```python
+Nnef.write_model_to_tar_gz(model: Model, path: str) -> None
+```
+
+Write the model as a gzip-compressed `.tar.gz` archive. This is the most common serialization format for distribution.
+
+---
+
+## Enabling extensions
+
+By default the NNEF context only supports the standard NNEF operator set. Enable extensions to load or save models that use additional operators.
+
+| Method | Enables |
+|---|---|
+| `with_tract_core()` | tract-core operator set — needed for most models saved by tract |
+| `with_tract_extra()` | tract-extra operators |
+| `with_onnx()` | ONNX-compatible operator set |
+| `with_pulse()` | Pulse (audio streaming) operators |
+| `with_tract_transformers()` | Transformer-specific operators |
+| `with_extended_identifier_syntax()` | PyTorch 2-style path-like node identifiers |
+
+All `with_*()` methods return `self`, so they can be chained:
+
+```python
+nnef = tract.nnef().with_tract_core().with_onnx()
+model = nnef.load("model.nnef.tgz")
+```
+
+---
+
+## Full workflow example
+
+<Steps>
+  <Step title="Convert once (offline)">
+    Load from ONNX, cook, and serialize to NNEF:
+
+    ```python
+    import tract
+
+    nnef = tract.nnef()
+    model = tract.onnx().load("model.onnx").into_model()
+    nnef.write_model_to_tar_gz(model, "model.nnef.tgz")
+    ```
+  </Step>
+  <Step title="Load at runtime">
+    Load the pre-cooked NNEF and run inference:
+
+    ```python
+    import tract
+    import numpy
+
+    model = tract.nnef().load("model.nnef.tgz").into_runnable()
+
+    input_array = numpy.random.rand(1, 3, 224, 224).astype(numpy.float32)
+    result = model.run([input_array])
+    print(result[0].to_numpy())
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Serializing to NNEF before deployment can significantly reduce startup time. The NNEF form skips shape inference and model analysis steps that happen when loading from ONNX.
+</Tip>
+
+---
+
+## Round-trip example
+
+```python
+import tract
+import numpy
+
+# --- Offline: convert and save ---
+onnx_model = (
+    tract.onnx()
+    .load("mobilenetv2-7.onnx")
+    .into_model()
+)
+tract.nnef().write_model_to_tar_gz(onnx_model, "mobilenet.nnef.tgz")
+
+# --- Runtime: load and run ---
+runnable = tract.nnef().load("mobilenet.nnef.tgz").into_runnable()
+
+image = numpy.random.rand(1, 3, 224, 224).astype(numpy.float32)
+outputs = runnable.run([image])
+confidences = outputs[0].to_numpy()
+print("Top class:", confidences.argmax())
+```

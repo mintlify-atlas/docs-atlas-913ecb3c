@@ -1,0 +1,254 @@
+---
+title: "C API reference"
+description: "Complete reference for all tract C API functions"
+---
+
+## Error handling
+
+<ParamField path="tract_get_last_error" type="function">
+  Returns a pointer to the last error message string. Valid until the next tract call.
+
+  ```c
+  const char *tract_get_last_error(void);
+  ```
+</ParamField>
+
+All other functions return `TRACT_RESULT`:
+- `TRACT_RESULT_OK` (0) — success
+- `TRACT_RESULT_KO` (1) — error; call `tract_get_last_error()` for details
+
+---
+
+## NNEF
+
+<ParamField path="tract_nnef_create" type="function">
+  Create a new NNEF parser instance.
+
+  ```c
+  TRACT_RESULT tract_nnef_create(TractNnef **out);
+  ```
+</ParamField>
+
+<ParamField path="tract_nnef_destroy" type="function">
+  Destroy an NNEF instance and NULL the pointer.
+
+  ```c
+  TRACT_RESULT tract_nnef_destroy(TractNnef **nnef);
+  ```
+</ParamField>
+
+<ParamField path="tract_nnef_load" type="function">
+  Load a model from a NNEF directory or `.tgz` file.
+
+  ```c
+  TRACT_RESULT tract_nnef_load(TractNnef *nnef, const char *path, TractModel **model);
+  ```
+</ParamField>
+
+<ParamField path="tract_nnef_write_model_to_tar_gz" type="function">
+  Serialize a model to a gzip-compressed tar archive.
+
+  ```c
+  TRACT_RESULT tract_nnef_write_model_to_tar_gz(
+      TractNnef *nnef,
+      const char *path,
+      TractModel *model
+  );
+  ```
+</ParamField>
+
+### NNEF extension methods
+
+Call these on a `TractNnef *` before loading a model if the model uses operators beyond base NNEF:
+
+```c
+TRACT_RESULT tract_nnef_enable_tract_core(TractNnef *nnef);
+TRACT_RESULT tract_nnef_enable_tract_extra(TractNnef *nnef);
+TRACT_RESULT tract_nnef_enable_onnx(TractNnef *nnef);
+TRACT_RESULT tract_nnef_enable_pulse(TractNnef *nnef);
+TRACT_RESULT tract_nnef_enable_tract_transformers(TractNnef *nnef);
+```
+
+---
+
+## ONNX
+
+<ParamField path="tract_onnx_create" type="function">
+  Create a new ONNX parser instance.
+
+  ```c
+  TRACT_RESULT tract_onnx_create(TractOnnx **out);
+  ```
+</ParamField>
+
+<ParamField path="tract_onnx_destroy" type="function">
+  Destroy an ONNX instance.
+
+  ```c
+  TRACT_RESULT tract_onnx_destroy(TractOnnx **onnx);
+  ```
+</ParamField>
+
+<ParamField path="tract_onnx_load" type="function">
+  Load an ONNX model from a `.onnx` protobuf file. Produces an untyped inference model.
+
+  ```c
+  TRACT_RESULT tract_onnx_load(TractOnnx *onnx, const char *path, TractInferenceModel **model);
+  ```
+</ParamField>
+
+---
+
+## Runtime
+
+<ParamField path="tract_runtime_for_name" type="function">
+  Get a runtime by name. Use `"default"` for CPU, `"cuda"` for CUDA, or `"metal"` for Apple Metal.
+
+  ```c
+  TRACT_RESULT tract_runtime_for_name(const char *name, TractRuntime **out);
+  ```
+</ParamField>
+
+<ParamField path="tract_runtime_prepare" type="function">
+  Optimize a model for the runtime and produce a `TractRunnable`. Consumes and NULLs the `model` pointer.
+
+  ```c
+  TRACT_RESULT tract_runtime_prepare(
+      TractRuntime *runtime,
+      TractModel **model,
+      TractRunnable **runnable
+  );
+  ```
+</ParamField>
+
+<ParamField path="tract_runtime_destroy" type="function">
+  Destroy a runtime instance.
+
+  ```c
+  TRACT_RESULT tract_runtime_destroy(TractRuntime **runtime);
+  ```
+</ParamField>
+
+---
+
+## Runnable
+
+<ParamField path="tract_runnable_run" type="function">
+  Run the model with a single set of inputs. Stateless — creates and destroys internal state.
+
+  ```c
+  TRACT_RESULT tract_runnable_run(
+      TractRunnable *runnable,
+      TractTensor **inputs,
+      TractTensor **outputs
+  );
+  ```
+
+  `inputs` and `outputs` are arrays of `TractTensor *`. The run consumes each input tensor (sets pointer to NULL).
+</ParamField>
+
+<ParamField path="tract_runnable_spawn_state" type="function">
+  Create a stateful session from a runnable. Use for RNNs or streaming inference.
+
+  ```c
+  TRACT_RESULT tract_runnable_spawn_state(TractRunnable *runnable, TractState **state);
+  ```
+</ParamField>
+
+<ParamField path="tract_runnable_release" type="function">
+  Release a reference to a runnable (reference-counted). NULLs the pointer.
+
+  ```c
+  TRACT_RESULT tract_runnable_release(TractRunnable **runnable);
+  ```
+</ParamField>
+
+---
+
+## State
+
+<ParamField path="tract_state_run" type="function">
+  Run one step through a stateful session. Maintains internal state across calls (e.g., LSTM hidden state).
+
+  ```c
+  TRACT_RESULT tract_state_run(
+      TractState *state,
+      TractTensor **inputs,
+      TractTensor **outputs
+  );
+  ```
+</ParamField>
+
+<ParamField path="tract_state_destroy" type="function">
+  Destroy a state session.
+
+  ```c
+  TRACT_RESULT tract_state_destroy(TractState **state);
+  ```
+</ParamField>
+
+---
+
+## Tensor
+
+<ParamField path="tract_tensor_from_bytes" type="function">
+  Create a tensor from a raw byte buffer. The data is copied.
+
+  ```c
+  TRACT_RESULT tract_tensor_from_bytes(
+      TractDatumType dt,
+      size_t rank,
+      const size_t *shape,
+      const void *data,
+      TractTensor **out
+  );
+  ```
+
+  Example:
+  ```c
+  size_t shape[] = {1, 3, 224, 224};
+  TractTensor *t = NULL;
+  tract_tensor_from_bytes(TRACT_DATUM_TYPE_F32, 4, shape, float_data, &t);
+  ```
+</ParamField>
+
+<ParamField path="tract_tensor_as_bytes" type="function">
+  Access the tensor's data as a byte pointer (no copy). Any output argument may be NULL if not needed.
+
+  ```c
+  TRACT_RESULT tract_tensor_as_bytes(
+      TractTensor *tensor,
+      TractDatumType *dt,
+      size_t *rank,
+      size_t *shape,
+      const void **data
+  );
+  ```
+</ParamField>
+
+<ParamField path="tract_tensor_destroy" type="function">
+  Destroy a tensor and NULL the pointer.
+
+  ```c
+  TRACT_RESULT tract_tensor_destroy(TractTensor **tensor);
+  ```
+</ParamField>
+
+---
+
+## DatumType enum
+
+| Constant | Description |
+|----------|-------------|
+| `TRACT_DATUM_TYPE_F16` | 16-bit float |
+| `TRACT_DATUM_TYPE_F32` | 32-bit float |
+| `TRACT_DATUM_TYPE_F64` | 64-bit float |
+| `TRACT_DATUM_TYPE_I8` | Signed 8-bit integer |
+| `TRACT_DATUM_TYPE_I16` | Signed 16-bit integer |
+| `TRACT_DATUM_TYPE_I32` | Signed 32-bit integer |
+| `TRACT_DATUM_TYPE_I64` | Signed 64-bit integer |
+| `TRACT_DATUM_TYPE_U8` | Unsigned 8-bit integer |
+| `TRACT_DATUM_TYPE_U16` | Unsigned 16-bit integer |
+| `TRACT_DATUM_TYPE_U32` | Unsigned 32-bit integer |
+| `TRACT_DATUM_TYPE_U64` | Unsigned 64-bit integer |
+| `TRACT_DATUM_TYPE_BOOL` | Boolean |

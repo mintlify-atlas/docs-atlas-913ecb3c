@@ -1,0 +1,181 @@
+---
+title: "Hardware backends"
+description: "CPU, CUDA, and Metal backends for accelerated inference"
+---
+
+tract selects compute kernels through the `Runtime` trait. By default it uses an optimized CPU backend. On Apple platforms and CUDA-capable Linux/Windows systems, GPU backends are available via `tract-metal` and `tract-cuda` respectively.
+
+## Default CPU backend
+
+The CPU backend is always available and requires no configuration. At model preparation time (`into_runnable()` or `runtime.prepare(model)`), tract inspects the host CPU's feature flags and selects the best available SIMD kernels.
+
+| Platform | Supported ISA extensions |
+|---|---|
+| ARM v6 | VFP |
+| ARM v7 | NEON |
+| ARM v8 / AArch64 | NEON |
+| Apple Silicon (M-series) | NEON + AMX (experimental) |
+| x86 / x86-64 | SSE2, AVX, FMA, AVX-512 |
+| WebAssembly | SIMD128 |
+
+Kernel dispatch is transparent: the same Rust code runs on all platforms; tract picks the fastest implementation at runtime.
+
+### Benchmark: Inception v3
+
+The following numbers are from the tract README, running on single-core Raspberry Pi devices:
+
+| Device | CPU family | TF-Lite | tract |
+|---|---|---|---|
+| Raspberry Pi Zero | ARMv6 VFP | 113 s | **39 s** |
+| Raspberry Pi 2 | ARMv7 NEON | 25 s | **7 s** |
+| Raspberry Pi 3 | AArch32 NEON | 5 s | **5 s** |
+
+<Note>
+  The Raspberry Pi 3 result runs on Raspbian (an ARMv6 OS), which prevents tract from using the ARMv8 NEON extensions available on the hardware. Both benchmarks ran on a single core.
+</Note>
+
+---
+
+## GPU backends
+
+GPU backends implement the same `Runtime` trait as the CPU backend. Switching runtimes requires only a one-line change.
+
+<Warning>
+  GPU backend support is experimental. Not all operators are accelerated on GPU; those that are not fall back to the CPU backend automatically. Performance characteristics and API stability may change between releases.
+</Warning>
+
+<Tabs>
+  <Tab title="tract-metal (Apple)">
+    ### tract-metal — Apple Metal
+
+    `tract-metal` accelerates inference on Apple GPUs using the Metal framework. It is activated automatically when compiling for any Apple target (`target_vendor = "apple"`), including macOS and iOS.
+
+    The `tract` facade crate (`api/rs`) unconditionally links `tract-metal` on Apple targets:
+
+    ```rust
+    // From api/rs/src/lib.rs — no action needed in application code:
+    #[cfg(target_vendor = "apple")]
+    extern crate tract_metal;
+    ```
+
+    Because of this `extern crate` declaration, simply depending on the `tract` crate is sufficient to activate Metal. No explicit setup code is required.
+
+    **Using Metal explicitly:**
+
+    ```rust
+    use tract::prelude::*;
+
+    // Load and type the model first
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    // Prepare with the Metal runtime
+    let runtime = runtime_for_name("metal")?;
+    let runnable = runtime.prepare(typed_model)?;
+
+    let output = runnable.run([input])?;
+    ```
+
+    **AMX (Apple Matrix Extension):**
+
+    Apple Silicon chips include AMX coprocessors for accelerated matrix operations. tract has experimental AMX support. It is enabled automatically when running on M-series hardware; no configuration is needed.
+  </Tab>
+  <Tab title="tract-cuda (Linux/Windows)">
+    ### tract-cuda — CUDA
+
+    `tract-cuda` accelerates inference on NVIDIA GPUs using CUDA and cuDNN. It is activated automatically on Linux and Windows targets.
+
+    The `tract` facade crate links `tract-cuda` automatically on supported platforms:
+
+    ```rust
+    // From api/rs/src/lib.rs — no action needed in application code:
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    extern crate tract_cuda;
+    ```
+
+    **Using CUDA explicitly:**
+
+    ```rust
+    use tract::prelude::*;
+
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    // Prepare with the CUDA runtime
+    let runtime = runtime_for_name("cuda")?;
+    let runnable = runtime.prepare(typed_model)?;
+
+    let output = runnable.run([input])?;
+    ```
+
+    **Requirements:**
+
+    - A CUDA-capable NVIDIA GPU
+    - CUDA toolkit and cuDNN installed on the host system
+    - The `cudarc` crate dependency (pulled in automatically via `tract-cuda`)
+
+    <Warning>
+      `runtime_for_name("cuda")` returns an error if no CUDA runtime is available on the system, even if the `tract-cuda` crate is linked. Always handle this error gracefully and fall back to the CPU runtime when needed.
+    </Warning>
+  </Tab>
+</Tabs>
+
+---
+
+## Selecting a runtime
+
+<Steps>
+  <Step title="Default: use the CPU runtime">
+    No configuration is needed. Call `model.into_runnable()` and tract picks the best CPU kernels automatically.
+
+    ```rust
+    use tract::prelude::*;
+
+    let model = onnx()?.load("model.onnx")?.into_model()?.into_runnable()?;
+    let output = model.run([input])?;
+    ```
+  </Step>
+
+  <Step title="Explicit GPU runtime">
+    Use `runtime_for_name()` to select a backend by name, then call `runtime.prepare(model)` in place of `model.into_runnable()`.
+
+    ```rust
+    use tract::prelude::*;
+
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    let runtime = runtime_for_name("metal")?;  // or "cuda"
+    let runnable = runtime.prepare(typed_model)?;
+
+    let output = runnable.run([input])?;
+    ```
+  </Step>
+
+  <Step title="Graceful fallback">
+    If a GPU runtime may not be present (e.g., distributing to heterogeneous devices), fall back to the CPU runtime on error.
+
+    ```rust
+    use tract::prelude::*;
+
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    let runnable = if let Ok(rt) = runtime_for_name("metal") {
+        rt.prepare(typed_model)?
+    } else {
+        typed_model.into_runnable()?  // CPU fallback
+    };
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Runtime availability by platform
+
+| Runtime name | Platform | Crate | Auto-activated |
+|---|---|---|---|
+| `"default"` (CPU) | All | `tract-core` + `tract-linalg` | Yes |
+| `"metal"` | macOS, iOS (Apple Silicon and Intel) | `tract-metal` | Yes, on `target_vendor = "apple"` |
+| `"cuda"` | Linux, Windows (NVIDIA GPU) | `tract-cuda` | Yes, on Linux/Windows builds |
+
+<Info>
+  Both GPU crates are linked unconditionally by the `tract` facade crate when the target platform matches. The runtime only becomes active at execution time if the corresponding hardware and drivers are present. An unavailable runtime returns an error from `runtime_for_name()`; it does not panic.
+</Info>

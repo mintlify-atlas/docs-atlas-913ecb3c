@@ -1,97 +1,113 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "tract — Neural Network Inference"
+description: "Tiny, self-contained, high-performance neural network inference for ONNX, TensorFlow, and NNEF models. Built in Rust, optimized for edge and embedded deployment."
 ---
 
-## Setting up
+## What is tract?
 
-Get your documentation site up and running in minutes.
+tract is Sonos' neural network inference engine. It loads trained models from popular frameworks — ONNX, TensorFlow, and NNEF — optimizes them, and runs them with minimal overhead on your target hardware.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+Whether you're running image classification on a Raspberry Pi, wake-word detection on an ARM Cortex-A, or large language model inference on a GPU, tract gives you a single, dependency-light library to do it.
 
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first ONNX model in minutes with the Rust or Python API
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="download" href="/installation">
+    Add tract to your Rust, Python, or C project
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Concepts" icon="brain" href="/concepts/architecture">
+    Understand the crate architecture and inference pipeline
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/rust/overview">
+    Full reference for the Rust, Python, and C APIs
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Choose your format
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="ONNX" icon="diagram-project" href="/guides/onnx-inference">
+    Load PyTorch, Keras, and scikit-learn models exported to ONNX. ~85% operator coverage.
+  </Card>
+  <Card title="TensorFlow" icon="layer-group" href="/guides/tensorflow-inference">
+    Run TensorFlow 1.x frozen models directly, including Inception v3 and MobileNet.
+  </Card>
+  <Card title="NNEF" icon="box-archive" href="/guides/nnef-workflow">
+    Use NNEF for lightweight production deployment with the smallest possible runtime.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Getting started
 
-## Need inspiration?
+<Steps>
+  <Step title="Add tract to your project">
+    Add the `tract` crate to your `Cargo.toml` or install the Python package from PyPI.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    <CodeGroup>
+    ```toml Cargo.toml
+    [dependencies]
+    tract = "0.21"
+    ```
+    ```bash Python
+    pip install tract
+    ```
+    </CodeGroup>
+  </Step>
+  <Step title="Load a model">
+    Use the ONNX or NNEF loader to read your model file and prepare it for inference.
+
+    ```rust
+    use tract::prelude::*;
+
+    let model = tract::onnx()?
+        .load("mobilenetv2-7.onnx")?
+        .into_model()?
+        .into_runnable()?;
+    ```
+  </Step>
+  <Step title="Run inference">
+    Pass input tensors and collect results.
+
+    ```rust
+    let result = model.run([input])?;
+    let best = result[0].as_slice::<f32>()?.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap());
+    println!("Predicted class: {:?}", best);
+    ```
+  </Step>
+</Steps>
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="GPU acceleration" icon="microchip" href="/guides/gpu-inference">
+    CUDA on Linux/Windows, Apple Metal on macOS — plug in a Runtime for GPU inference with the same API.
+  </Card>
+  <Card title="Model optimization" icon="gauge-high" href="/guides/model-optimization">
+    Quantization, float precision translation, and NNEF serialization for embedded targets.
+  </Card>
+  <Card title="Streaming inference" icon="wave-square" href="/guides/streaming-pulse">
+    Pulse mode for real-time audio and streaming workloads on resource-constrained devices.
+  </Card>
+  <Card title="CLI tooling" icon="terminal" href="/cli/overview">
+    Inspect, benchmark, profile, and convert models from the command line.
+  </Card>
+</CardGroup>
+
+## Examples
+
+<CardGroup cols={2}>
+  <Card title="MobileNet with ONNX" icon="image" href="/examples/mobilenet-onnx">
+    Image classification with MobileNet v2 — a complete end-to-end Rust example.
+  </Card>
+  <Card title="BERT / ALBERT NLP" icon="comment" href="/examples/bert-nlp">
+    Run a transformer model for natural language processing tasks.
+  </Card>
+  <Card title="Stable Diffusion" icon="paintbrush" href="/examples/stable-diffusion">
+    Generate images using Stable Diffusion with tract's pipeline support.
+  </Card>
+  <Card title="LLM inference" icon="robot" href="/examples/llm-inference">
+    Causal language model inference with KV-cache and streaming output.
+  </Card>
+</CardGroup>

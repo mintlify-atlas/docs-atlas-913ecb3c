@@ -1,0 +1,121 @@
+---
+title: "TensorFlow inference"
+description: "Load and run TensorFlow 1.x frozen models with tract-tensorflow."
+---
+
+tract supports **TensorFlow 1.x frozen models** (`.pb` files) through the `tract-tensorflow` crate. TensorFlow 2.x is not directly supported — see the note below on conversion.
+
+<Warning>
+  TensorFlow support covers a narrower operator set than ONNX. If you have the option, prefer exporting your model to ONNX and using `tract-onnx` instead.
+</Warning>
+
+## Setup
+
+Add `tract-tensorflow` to your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+tract-tensorflow = "0.21"
+```
+
+## Loading a frozen model
+
+<Steps>
+  <Step title="Import the prelude">
+    ```rust
+    use tract_tensorflow::prelude::*;
+    ```
+  </Step>
+
+  <Step title="Load the model">
+    Use `tensorflow()` to obtain a TensorFlow framework instance, then call `model_for_path()` to parse the frozen protobuf.
+
+    ```rust
+    use tract_tensorflow::prelude::*;
+
+    let model = tensorflow()
+        .model_for_path("inception_v3.pb")?
+        .with_input_fact(0, f32::fact([1, 299, 299, 3]).into())?
+        .into_optimized()?
+        .into_runnable()?;
+    ```
+
+    `with_input_fact` sets the shape and dtype for input 0. The format mirrors the ONNX API: provide a static shape and a Rust primitive type to derive the datum type.
+  </Step>
+
+  <Step title="Run inference">
+    ```rust
+    use tract_tensorflow::prelude::*;
+    use tract_ndarray::Array4;
+
+    let input = Array4::<f32>::zeros((1, 299, 299, 3));
+    let result = model.run([input])?;
+    let scores = result[0].as_slice::<f32>()?;
+    println!("top class: {}", scores.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap());
+    ```
+  </Step>
+</Steps>
+
+## TensorFlow 2.x
+
+<Info>
+  Direct TF 2.x support is not planned. The complexity of eager execution and the Keras object model make a direct parser impractical.
+
+  **Recommended path:** export your TF 2.x / Keras model to ONNX, then use `tract-onnx`.
+
+  ```python
+  import tf2onnx
+  import tensorflow as tf
+
+  model = tf.keras.applications.MobileNetV2()
+  tf2onnx.convert.from_keras(model, output_path="mobilenet.onnx")
+  ```
+
+  Then load with `tract::onnx()` as shown in the [ONNX inference guide](/guides/onnx-inference).
+</Info>
+
+## Supported TensorFlow operators
+
+The following TF 1.x operators are implemented and tested:
+
+<AccordionGroup>
+  <Accordion title="Math and arithmetic">
+    Abs, Add, AddN, AddV2, BiasAdd, Ceil, Div, FloorMod, Log, MatMul, Max, Mean, Min, Mul, Neg, Pow, Prod, RealDiv, Reciprocal (via Rsqrt), Rsqrt, Sub, Sum
+  </Accordion>
+  <Accordion title="Neural network layers">
+    AvgPool, BlockLSTM, Conv2D, DepthwiseConv2dNative, FakeQuantWithMinMaxVars, FusedBatchNorm, MaxPool, Relu, Relu6, Sigmoid, Softmax, Tanh
+  </Accordion>
+  <Accordion title="Tensor manipulation">
+    BatchToSpaceND, ConcatV2, DepthwiseConv2dNative, ExpandDims, GatherNd, GatherV2, Pack, Pad, Range, Reshape, Shape, Slice, SpaceToBatchND, Squeeze, StridedSlice, Tile, Transpose
+  </Accordion>
+  <Accordion title="Control flow and variables">
+    Assign, Cast, Const, Enter, Equal, Exit, Fill, Greater, GreaterEqual, Identity, Less, LessEqual, LogicalAnd, LogicalOr, LoopCond, Merge, NoOp, Placeholder, RandomUniform, RandomUniformInt, Switch, VariableV2
+  </Accordion>
+</AccordionGroup>
+
+## Limitations
+
+<Warning>
+  **Narrower operator coverage.** TensorFlow's operator set is large and heterogeneous. tract covers the subset that appears in production models like Inception v3 and Snips wake-word detectors. Operators outside this set will return an error at load time.
+</Warning>
+
+- No TF 2.x / SavedModel format support.
+- No TensorFlow Lite (`.tflite`) support — convert to ONNX first.
+- `tract-kaldi` exists for Kaldi models but is considered experimental.
+
+## Performance reference
+
+On Inception v3 (single-threaded):
+
+| Device | Family | TensorFlow Lite | tract |
+|---|---|---|---|
+| Raspberry Pi Zero | ARMv6 VFP | 113 s | 39 s |
+| Raspberry Pi 2 | ARMv7 NEON | 25 s | 7 s |
+| Raspberry Pi 3 | aarch32 NEON | 5 s | 5 s |
+
+<Note>
+  For new projects targeting embedded or edge inference, consider converting models to NNEF after optimization. See the [NNEF workflow guide](/guides/nnef-workflow) for details.
+</Note>

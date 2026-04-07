@@ -1,0 +1,81 @@
+---
+title: 'Introduction'
+description: 'tract is a neural network inference engine by Sonos, designed for edge deployment and real-time streaming applications.'
+---
+
+tract is a neural network inference engine built by Sonos. It takes trained models from higher-level frameworks, converts them to an optimized internal representation, and runs them on end-user data. It is designed to be portable and embedding-friendly, with particular attention given to ARM Cortex-A CPUs in resource-constrained environments.
+
+## Key use cases
+
+- **ONNX inference** — load and run ONNX models with ~85% operator coverage, including all major vision backbones (AlexNet, ResNet, Inception, DenseNet, VGG, ShuffleNet, SqueezeNet)
+- **TensorFlow 1.x inference** — run frozen TensorFlow 1.x graphs, including Inception v3 and wake word models
+- **Edge and embedded deployment** — runs efficiently on ARM Cortex-M microcontrollers and single-board computers; on a Raspberry Pi Zero, Inception v3 runs in ~39s vs 113s for TensorFlow Lite
+- **Real-time audio streaming** — pulsing capability enables streaming (online) inference for WaveNet and similar architectures without buffering entire sequences
+
+## Supported model formats
+
+| Format | Support level |
+|---|---|
+| ONNX | ~85% of operators (opsets 9–18) |
+| TensorFlow 1.x | Frozen graphs; common production operators |
+| NNEF | Most of the specification; missing ROI operators |
+| TFLite | TensorFlow 2 models can be converted to ONNX first |
+
+<Note>
+TensorFlow 2 does not have direct support due to its complexity. Most TF2 models can be exported to ONNX and then loaded by tract.
+</Note>
+
+## Architecture overview
+
+tract is organized as a layered crate ecosystem. Each layer builds on the one below it.
+
+### Core crates
+
+- **tract-data** — `Tensor` struct, `DatumType` enum, and `TDim` symbolic dimension type. The foundational data types used throughout tract.
+- **tract-linalg** — Low-level optimized computation routines. Provides fast kernels for ARM v6/v7/v8, Intel, and other platforms. Not intended for direct use.
+- **tract-core** — The heart of tract. Contains the network graph representation (`Graph`, `Node`), the core operator set, and most optimization logic.
+
+### Format parsers
+
+- **tract-nnef** — NNEF format support. Maps NNEF operators to tract-core operators, and includes the tract-OPL proprietary extensions. This is the preferred entry point for embedded deployments where startup time matters.
+- **tract-onnx** — ONNX protobuf format support. Parses ONNX and maps operators through tract-hir to tract-core. Use this to load `.onnx` files at runtime.
+- **tract-tensorflow** — TensorFlow 1.x frozen model support. Similar structure to the ONNX crates.
+
+### Additional crates
+
+- **tract-hir** — High-level intermediate representation. Handles Python/NumPy idioms (negative indexing, rank broadcasting) from training frameworks before passing to tract-core.
+- **tract-pulse** and **tract-pulse-opl** — Streaming (pulsing) network support. Translates batch networks to online streaming inference.
+
+### tract-OPL
+
+tract-OPL is an intermediate representation based on NNEF that extends it with proprietary operators for features NNEF does not cover (pulse operators, recurrent operators, symbolic extensions). It enables a split between model preparation time and runtime:
+
+1. At preparation time, use `tract-onnx` or `tract-tensorflow` to load and convert a model, then serialize it to NNEF/OPL format.
+2. At runtime, load only `tract-core` + `tract-nnef` — a much smaller and faster-starting binary — with no dependency on the full ONNX or TensorFlow parsers.
+
+## Language support
+
+tract provides first-class APIs in multiple languages.
+
+<CardGroup cols={3}>
+  <Card title="Rust" icon="rust" href="/quickstart">
+    Native library. Primary API via the `tract` crate. Full access to all features including model optimization and pulse streaming.
+  </Card>
+  <Card title="Python" icon="python" href="/quickstart">
+    Python bindings via the `tract` PyPI package. Wraps the native Rust library through C FFI. Supports numpy arrays for input and output.
+  </Card>
+  <Card title="C / FFI" icon="c" href="/installation">
+    C-compatible FFI through the `tract-ffi` crate. Enables integration from any language that can call C functions.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run MobileNet v2 inference in Rust or Python in under five minutes.
+  </Card>
+  <Card title="Installation" icon="package" href="/installation">
+    Add tract to your Rust project, install the Python package, or set up the CLI.
+  </Card>
+</CardGroup>

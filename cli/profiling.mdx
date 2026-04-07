@@ -1,0 +1,153 @@
+---
+title: "Profiling models"
+description: "Profile per-operator cost and performance with the tract CLI"
+---
+
+`tract` can measure both arithmetic cost (FLOPs) and wall-clock time per operator. This helps you identify bottlenecks, verify optimization passes are working, and build regression test cases.
+
+## Quick profiling
+
+The fastest way to get a performance picture is to combine `--profile` and `--cost` with the `dump` subcommand:
+
+```bash
+tract -O mobilenetv2-7.onnx -i 1,3,224,224,f32 dump --profile --cost
+```
+
+This runs the model repeatedly to collect timing samples, then prints a table showing:
+
+- **Running time** for each operator
+- **Relative weight** — that operator's share of total inference time
+- **FLOPs** for compute-intensive operations (convolutions, matrix multiplications)
+
+<Warning>
+  Always pass `-O` when profiling. Without it, you measure the unoptimized graph, which does not reflect real-world performance. tract will warn you if you forget.
+</Warning>
+
+## Understanding FLOPs counts
+
+tract counts **multiplications only** — not multiply-add pairs. Many HPC benchmarks and BLAS libraries count each multiply-add as two operations (one multiplication + one addition).
+
+<Info>
+  To compare tract's reported FLOPs against BLAS or other frameworks, **double the tract number**. A convolution that tract reports as 1 GFLOPs is equivalent to 2 GFLOPs in the BLAS convention.
+</Info>
+
+## Machine-readable output
+
+The human-readable profile table format is not stable. For scripting and automated analysis, use `--json`:
+
+```bash
+tract -O mobilenetv2-7.onnx -i 1,3,224,224,f32 dump --profile --cost --json
+```
+
+The JSON output is less likely to change between releases, though it carries no formal stability guarantee either.
+
+## Building regression test cases
+
+The `run` subcommand can load inputs from a NumPy `.npz` bundle and assert that model outputs match expected values. This is useful for both non-regression testing and debugging numerical issues.
+
+<Steps>
+  <Step title="Generate an io.npz bundle from Python">
+    Use NumPy to capture real inputs and reference outputs from a known-good framework:
+
+    ```python
+    import numpy as np
+    import onnxruntime as ort
+
+    session = ort.InferenceSession("model.onnx")
+    inputs = {"input": np.random.randn(1, 3, 224, 224).astype(np.float32)}
+    outputs = session.run(None, inputs)
+
+    np.savez(
+        "io.npz",
+        input=inputs["input"],
+        output=outputs[0],
+    )
+    ```
+  </Step>
+  <Step title="Run with input from the bundle">
+    ```bash
+    tract model.onnx -O run --input-from-bundle io.npz
+    ```
+
+    Input shapes and dtypes are inferred directly from the tensors in the `.npz` file, overriding any `-i` flag.
+  </Step>
+  <Step title="Assert outputs match expected values">
+    ```bash
+    tract model.onnx -O run \
+      --input-from-bundle io.npz \
+      --assert-output-bundle io.npz
+    ```
+
+    tract matches tensors in the bundle to model outputs by name, then checks that values agree within a tolerance.
+  </Step>
+  <Step title="Verify the assertion actually ran">
+    Add `-v` to confirm the check is being executed:
+
+    ```bash
+    tract -v model.onnx -O run \
+      --input-from-bundle io.npz \
+      --assert-output-bundle io.npz
+    ```
+
+    A successful run prints `Checked output #0, ok.` in the log.
+  </Step>
+</Steps>
+
+## Models without embedded type information
+
+Some models (especially NNEF or custom exports) do not embed input dtype and shape information. Use `--input-facts-from-bundle` to set these from the `.npz` file during model loading, then `--input-from-bundle` to provide the actual values at run time:
+
+```bash
+tract model.nnef.tgz \
+  --input-facts-from-bundle io.npz \
+  run \
+  --input-from-bundle io.npz \
+  --assert-output-bundle io.npz
+```
+
+<Note>
+  `--input-facts-from-bundle` sets input *facts* (shape + dtype) during the loading pipeline. `--input-from-bundle` sets the *values* used when running the model. They serve different purposes and can be combined.
+</Note>
+
+## Interpreting profile output
+
+When reading the profile table, focus on operators with high **relative weight** — these are the ones worth optimizing.
+
+<AccordionGroup>
+  <Accordion title="High relative time on a single operator">
+    This usually means the operator is not being lowered to an optimized kernel. Check whether `-O` is set and whether the operation's dtype is supported by the fast path (e.g., f32 has better support than f16 on some targets).
+  </Accordion>
+  <Accordion title="Many small operators each with low relative time">
+    Overhead from dispatching many small operations. Consider fusing layers at the model level (e.g., combining normalization into adjacent matmuls) before export.
+  </Accordion>
+  <Accordion title="FLOPs count is low but time is high">
+    Often indicates memory bandwidth saturation rather than compute saturation. Large activation tensors or frequent cache misses are common causes.
+  </Accordion>
+  <Accordion title="Profiling a debug build">
+    tract warns when `--profile` is used against a debug build of tract itself. Always profile a release build: `cargo build --release` or use a prebuilt binary.
+  </Accordion>
+</AccordionGroup>
+
+## Tips for embedded and cross-platform targets
+
+Running `tract bench` on the actual target device gives you accurate latency numbers for that hardware. However, profiling on device is often impractical. A recommended workflow:
+
+<Steps>
+  <Step title="Profile on host">
+    Run `dump --profile --cost` on your development machine to identify hot operators. Relative weights are often similar across architectures.
+  </Step>
+  <Step title="Benchmark on device">
+    Copy the model to the target and run `bench` to get absolute latency:
+
+    ```bash
+    tract -O model.nnef.tgz bench
+    ```
+  </Step>
+  <Step title="Iterate on the host">
+    Use profile data from the host to guide optimization work, then verify improvements with `bench` on device.
+  </Step>
+</Steps>
+
+<Tip>
+  When benchmarking on embedded targets with limited storage, prefer the NNEF format — it can be loaded and optimized at runtime and avoids shipping a separate optimized binary for each target.
+</Tip>

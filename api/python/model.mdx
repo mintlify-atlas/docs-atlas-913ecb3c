@@ -1,0 +1,275 @@
+---
+title: "Python: Model, Runnable, and State"
+description: "Running inference with Python tract objects"
+---
+
+After loading from ONNX or NNEF you have a `Model`. From there the pipeline is:
+
+```
+Model  →  (into_runnable / Runtime.prepare)  →  Runnable  →  (spawn_state)  →  State
+```
+
+`Runnable.run()` is a convenience that internally spawns a state and runs one turn. Use `State` directly when you need streaming (stateful) inference or want to reuse the same state across multiple calls.
+
+---
+
+## Model
+
+`Model` is the central object for model transformation and "cooking". It wraps tract's `TypedModel` — all shapes and element types are known (possibly via symbolic dimensions).
+
+### Inspecting a model
+
+| Method | Returns | Description |
+|---|---|---|
+| `input_count()` | `int` | Number of model inputs |
+| `output_count()` | `int` | Number of model outputs |
+| `input_name(id: int)` | `str` | Name of the `id`-th input |
+| `output_name(id: int)` | `str` | Name of the `id`-th output |
+| `input_fact(id: int)` | `Fact` | Shape/type descriptor for the `id`-th input |
+| `output_fact(id: int)` | `Fact` | Shape/type descriptor for the `id`-th output |
+
+### Transforming a model
+
+```python
+Model.transform(spec: str | TransformSpec) -> None
+```
+
+Apply a named transformation in-place. `spec` can be:
+
+- A plain string name, e.g. `"float_precision"` or `"unfold-kv-cache"`
+- A JSON string with a `"name"` key and parameters
+- A `TransformSpec` subclass instance (`ConcretizeSymbols`, `FloatPrecision`, `Pulse`)
+
+### Model properties
+
+Some models embed named tensor properties (e.g. pre-trained weights or configuration tensors):
+
+```python
+Model.property_keys() -> List[str]   # list available property names
+Model.property(name: str) -> Tensor  # retrieve a property by name
+```
+
+### Converting to Runnable
+
+```python
+Model.into_runnable() -> Runnable
+```
+
+Optimize the model for the default CPU runtime and return a `Runnable`. The `Model` is consumed by this call.
+
+---
+
+## Runtime
+
+`Runtime` represents a hardware/software execution backend. The default CPU path is used implicitly by `Model.into_runnable()`. For GPU execution, obtain a `Runtime` by name.
+
+### `tract.runtime_for_name`
+
+```python
+tract.runtime_for_name(name: str) -> Runtime
+```
+
+Available names:
+
+| Name | Backend |
+|---|---|
+| `"default"` | CPU (always available) |
+| `"metal"` | Apple Silicon GPU (macOS) |
+| `"cuda"` | NVIDIA GPU |
+
+### `Runtime.prepare`
+
+```python
+Runtime.prepare(model: Model) -> Runnable
+```
+
+Compile a `Model` for this runtime. The `Model` is consumed.
+
+```python
+rt = tract.runtime_for_name("metal")
+runnable = rt.prepare(model)
+```
+
+---
+
+## Runnable
+
+A `Runnable` is a fully optimized, executable model. It is reference-counted and can spawn multiple independent `State` instances.
+
+### Running inference
+
+```python
+Runnable.run(inputs: List[numpy.ndarray | Tensor]) -> List[Tensor]
+```
+
+Convenience method — spawns a fresh `State`, runs one turn, and returns the outputs. Use this for stateless models.
+
+```python
+outputs = runnable.run([input_array])
+result = outputs[0].to_numpy()
+```
+
+### Spawning a state
+
+```python
+Runnable.spawn_state() -> State
+```
+
+Create an independent mutable execution state. Use this for stateful (streaming) models or to run multiple inferences concurrently.
+
+### Inspecting a Runnable
+
+| Method | Returns | Description |
+|---|---|---|
+| `input_count()` | `int` | Number of inputs |
+| `output_count()` | `int` | Number of outputs |
+| `input_fact(id: int)` | `Fact` | Fact for the `id`-th input |
+| `output_fact(id: int)` | `Fact` | Fact for the `id`-th output |
+| `property_keys()` | `List[str]` | Names of embedded properties |
+| `property(name: str)` | `Tensor` | Retrieve a property |
+
+### Profiling
+
+```python
+Runnable.profile_json(inputs: List[numpy.ndarray] | None) -> str
+```
+
+Returns a JSON string with per-operator static cost estimates and, if `inputs` is provided, dynamic profiling measurements.
+
+---
+
+## State
+
+`State` holds the mutable execution context for a model. For stateless models `Runnable.run()` is simpler, but `State` is necessary when:
+
+- The model is pulsed (streaming), and internal buffers must persist between calls
+- You want to run multiple concurrent independent sessions from one `Runnable`
+
+### Running
+
+```python
+State.run(inputs: List[numpy.ndarray | Tensor]) -> List[Tensor]
+```
+
+Run one turn. For streaming models each call advances the model by one pulse.
+
+---
+
+## TransformSpec types
+
+Pass these to `Model.transform()` for typed, validated transform parameters.
+
+### `ConcretizeSymbols`
+
+Replace symbolic dimensions with concrete integers. Unlocks further optimizations.
+
+```python
+from tract import ConcretizeSymbols
+
+model.transform(ConcretizeSymbols({"B": 1, "T": 100}))
+# or builder pattern:
+model.transform(ConcretizeSymbols().value("B", 1).value("T", 100))
+```
+
+### `FloatPrecision`
+
+Change the float precision across the model (e.g., F32 → F16 for reduced memory and faster inference on supported hardware).
+
+```python
+from tract import FloatPrecision, DatumType
+
+model.transform(FloatPrecision(DatumType.F32, DatumType.F16))
+# with optional include/exclude node name patterns:
+model.transform(FloatPrecision(DatumType.F32, DatumType.F16, exclude=["output_layer"]))
+```
+
+### `Pulse`
+
+Convert a batch-oriented model into a streaming (pulsed) model.
+
+```python
+from tract import Pulse
+
+model.transform(Pulse("64", symbol="T"))
+# or builder pattern:
+model.transform(Pulse("64").symbol("T"))
+```
+
+---
+
+## State vs. Runnable.run()
+
+<CardGroup cols={2}>
+  <Card title="Use Runnable.run()">
+    - Stateless feedforward models (CNNs, transformers without KV cache)
+    - Single-shot inference
+    - Simplest code path
+  </Card>
+  <Card title="Use State.run()">
+    - Streaming / pulsed models (RNNs, streaming convolutions)
+    - Multiple sequential inputs sharing internal state
+    - Concurrent independent inference sessions from one `Runnable`
+  </Card>
+</CardGroup>
+
+---
+
+## Examples
+
+<CodeGroup>
+```python CPU inference (default)
+import tract
+import numpy
+
+model = (
+    tract.onnx()
+    .load("model.onnx")
+    .into_model()
+    .into_runnable()
+)
+
+inputs = [numpy.random.rand(1, 3, 224, 224).astype(numpy.float32)]
+outputs = model.run(inputs)
+print(outputs[0].to_numpy().shape)
+```
+
+```python GPU inference (Metal)
+import tract
+import numpy
+
+model = tract.onnx().load("model.onnx").into_model()
+rt = tract.runtime_for_name("metal")
+runnable = rt.prepare(model)
+
+inputs = [numpy.random.rand(1, 3, 224, 224).astype(numpy.float32)]
+outputs = runnable.run(inputs)
+```
+
+```python Streaming with State
+import tract
+import numpy
+
+runnable = tract.nnef().load("streaming_model.nnef.tgz").into_runnable()
+state = runnable.spawn_state()
+
+# Feed audio chunks one at a time
+for chunk in audio_chunks:
+    outputs = state.run([chunk])
+    process(outputs[0].to_numpy())
+```
+
+```python Model transforms
+import tract
+from tract import ConcretizeSymbols, FloatPrecision, DatumType
+
+model = tract.onnx().load("model.onnx").into_model()
+
+# Fix the batch dimension to 1
+model.transform(ConcretizeSymbols({"B": 1}))
+
+# Downcast to float16
+model.transform(FloatPrecision(DatumType.F32, DatumType.F16))
+
+runnable = model.into_runnable()
+```
+</CodeGroup>

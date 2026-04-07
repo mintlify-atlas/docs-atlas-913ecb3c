@@ -1,0 +1,149 @@
+---
+title: "Nnef"
+description: "Loading and saving models in NNEF format"
+---
+
+`Nnef` loads and writes models in [Neural Network Exchange Format (NNEF)](https://www.khronos.org/nnef). NNEF is more compact and faster to load than ONNX because the graph is already typed and decluttered. The recommended production workflow is to convert once from ONNX to NNEF at build time, then ship and load the NNEF artifact at runtime.
+
+## Creating an Nnef instance
+
+```rust
+use tract::prelude::*;
+
+let nnef = tract::nnef()?;
+```
+
+`tract::nnef()` returns `Result<Nnef>` and uses the standard NNEF op set. Enable extensions before calling any load or write method.
+
+## Enabling extensions
+
+NNEF has a strict op set. If your model uses operators outside the standard (tract-core ops, ONNX ops, streaming, transformers) you must enable the corresponding extension before loading or writing.
+
+<Warning>
+  Extensions must be enabled **before** calling `load`, `load_buffer`, or any `write_model_to_*` method. Enabling them after is a no-op on the current operation.
+</Warning>
+
+| Method | When to use |
+|---|---|
+| `enable_tract_core()` | tract-core operators not in NNEF (most converted models need this) |
+| `enable_tract_extra()` | Extra tract operators |
+| `enable_tract_transformers()` | Common transformer ops (attention, RoPE, etc.) |
+| `enable_onnx()` | ONNX ops serialized in OPL that are absent from NNEF |
+| `enable_pulse()` | Stateful streaming / pulsed models |
+| `enable_extended_identifier_syntax()` | Preserve node names containing special characters |
+
+Each `enable_*` method has a fluent `with_*` counterpart for method chaining:
+
+```rust
+let nnef = tract::nnef()?
+    .with_tract_core()?
+    .with_tract_transformers()?;
+```
+
+## Loading a model
+
+### From a file or directory
+
+<ParamField path="path" type="impl AsRef<Path>" required>
+  Path to a NNEF directory, `.tar` file, or `.tar.gz` file.
+</ParamField>
+
+```rust
+let model: Model = tract::nnef()?.load("model.nnef.tgz")?;
+```
+
+Returned directly as a `Model` (already typed and decluttered). No `into_model()` call needed.
+
+### From a byte buffer
+
+<ParamField path="data" type="&[u8]" required>
+  Raw bytes of a NNEF `.tar` or `.tar.gz` archive.
+</ParamField>
+
+```rust
+static NNEF_BYTES: &[u8] = include_bytes!("../assets/model.nnef.tgz");
+
+let model: Model = tract::nnef()?.load_buffer(NNEF_BYTES)?;
+```
+
+## Writing a model
+
+All three write methods accept a reference to a `Model` and a path. Choose the format based on your deployment target.
+
+### As a directory
+
+```rust
+tract::nnef()?.write_model_to_dir("output_dir/", &model)?;
+```
+
+Writes one file per tensor. Convenient during development for inspecting individual weights.
+
+### As a tar archive
+
+```rust
+tract::nnef()?.write_model_to_tar("model.nnef.tar", &model)?;
+```
+
+Single uncompressed archive. Slightly larger than `.tar.gz` but faster to load.
+
+### As a compressed tar archive
+
+```rust
+tract::nnef()?.write_model_to_tar_gz("model.nnef.tgz", &model)?;
+```
+
+<Tip>
+  `.tar.gz` / `.tgz` is the recommended format for deployment. It is smaller on disk and tract decompresses it transparently on load.
+</Tip>
+
+## ONNX-to-NNEF conversion workflow
+
+Convert a model once at build or training time, then load the compact NNEF artifact at runtime. This avoids the overhead of the ONNX parser and inference pass on every startup.
+
+```rust
+use tract::prelude::*;
+
+fn convert() -> anyhow::Result<()> {
+    // Load and type the ONNX model
+    let model = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?;
+
+    // Write as a compressed NNEF archive
+    tract::nnef()?.write_model_to_tar_gz("model.nnef.tgz", &model)?;
+    println!("Conversion complete.");
+    Ok(())
+}
+
+fn run() -> anyhow::Result<()> {
+    // Fast load at runtime — no ONNX parser, no shape inference
+    let model = tract::nnef()?
+        .load("model.nnef.tgz")?
+        .into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+    let outputs = model.run([input])?;
+    println!("output shape: {:?}", outputs[0].shape()?);
+    Ok(())
+}
+```
+
+## Example: model with extensions
+
+Some models serialized with tract use ops outside the base NNEF spec. Enable the required extensions before loading:
+
+```rust
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let model = tract::nnef()?
+        .with_tract_core()?
+        .with_tract_transformers()?
+        .load("llm_model.nnef.tgz")?
+        .into_runnable()?;
+
+    // ... run inference
+    Ok(())
+}
+```

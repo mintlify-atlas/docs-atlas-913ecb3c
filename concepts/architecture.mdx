@@ -1,0 +1,210 @@
+---
+title: "Architecture"
+description: "How tract's crate ecosystem is organized"
+---
+
+tract is a Rust neural network inference library composed of a layered set of crates. Each layer has a clear responsibility, and higher layers depend only on the layers below them. The recommended entry point for application code is the top-level `tract` crate (`api/rs`), which re-exports a clean public API over the full stack.
+
+## Crate dependency layers
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   CLI  /  api/rs  /  api/ffi                │  ← Application entry points
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                      tract-pulse                            │  ← Streaming / pulse inference
+│                   tract-pulse-opl                           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌──────────────┬────────────┼────────────┬────────────────────┐
+│ tract-onnx   │ tract-nnef │tract-tflite│ tract-tensorflow   │  ← Format front-ends
+│tract-onnx-opl│            │            │                    │
+└──────────────┴─────┬──────┴────────────┴────────────────────┘
+                     │
+          ┌──────────▼──────────┐
+          │     tract-hir       │  ← Training-framework compatibility layer
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │     tract-core      │  ← Graph/Node representation, operator set, optimizers
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │    tract-linalg     │  ← SIMD computation kernels
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │     tract-data      │  ← Tensor, DatumType, TDim
+          └─────────────────────┘
+```
+
+## What each crate does
+
+<AccordionGroup>
+  <Accordion title="tract-data — tensors and types">
+    The foundation of the entire stack. Provides:
+
+    - **`Tensor`** — the central n-dimensional array type used everywhere in tract.
+    - **`DatumType`** — an enum of all supported element types: `F32`, `F16`, `I8`, `U8`, `I32`, `I64`, `Bool`, and more.
+    - **`TDim`** — symbolic dimension values that can represent either a concrete integer or an algebraic expression (e.g., `batch_size * seq_len`). Enables shape inference on models with dynamic batch dimensions.
+
+    No other tract crate is a dependency of `tract-data`; all other crates depend on it transitively.
+  </Accordion>
+
+  <Accordion title="tract-linalg — SIMD computation kernels">
+    Low-level, platform-specific compute routines. Despite its name, this crate is not restricted to linear algebra — it covers all hot-path numerical operations needed for neural network inference.
+
+    Optimized target families:
+
+    | Platform | ISA extensions |
+    |---|---|
+    | ARM v6 | VFP |
+    | ARM v7 | NEON |
+    | ARM v8 / AArch64 | NEON, AMX (experimental) |
+    | x86 / x86-64 | SSE2, AVX, AVX-512 |
+    | WASM | SIMD128 |
+
+    `tract-linalg` is not intended for direct use by application code.
+  </Accordion>
+
+  <Accordion title="tract-core — graph, operators, and optimization">
+    The heart of tract. Contains:
+
+    - **`Graph<F, O>`** and **`BaseNode<F, O>`** — the generic directed-acyclic-graph representation. `F` is the Fact type (shape/type metadata per wire), `O` is the operator type.
+    - **`TypedModel`** (`Graph<TypedFact, Box<dyn TypedOp>>`) — the fully-typed, optimizable model representation.
+    - **`TypedFact`** — concrete shape (`ShapeFact`, a `Vec<TDim>`) plus element type plus an optional constant value for compile-time folding.
+    - The **core operator set** — convolutions, matrix multiplications, activations, reductions, and dozens more.
+    - Most of the **graph optimization and decluttering logic** — constant folding, operator fusion, dead-code elimination.
+
+    `tract-core` depends only on `tract-linalg` and `tract-data`.
+  </Accordion>
+
+  <Accordion title="tract-hir — training-framework compatibility layer">
+    Python training frameworks (TensorFlow, ONNX) expose "pythonisms" and "numpy-isms" that are convenient for model design but awkward at inference time. `tract-hir` translates these away before the model reaches `tract-core`.
+
+    Examples of handled patterns: negative axis indexing, negative rank indexing, rank broadcasting.
+
+    Provides:
+
+    - **`InferenceModel`** (`Graph<InferenceFact, Box<dyn InferenceOp>>`) — a model whose wire types and shapes may be partially unknown.
+    - **`InferenceFact`** — a flexible fact type where each field is an `Option`-like "factoid" that may be unknown. The analyser propagates information until all facts are fully resolved.
+    - The **analyser** — traverses the graph collaboratively with each `InferenceOp` to discover datum types and shapes, then converts the `InferenceModel` into a `TypedModel`.
+
+    `tract-hir` is not intended for direct use by application code.
+  </Accordion>
+
+  <Accordion title="tract-nnef — NNEF format and tract-OPL">
+    Supports loading and writing the NNEF (Neural Network Exchange Format) binary format, plus the **tract-OPL** extensions (see below). This is the preferred runtime format for production/embedded deployments.
+
+    - Maps NNEF operators directly to `tract-core` operators (the mapping is straightforward because NNEF is designed for inference).
+    - Implements the `Runtime` trait used by higher-level API code to prepare and execute models.
+    - `tract-nnef-resources` contains the bundled NNEF operator schemas.
+  </Accordion>
+
+  <Accordion title="tract-onnx and tract-onnx-opl — ONNX format">
+    - **`tract-onnx`** — parses `.onnx` protobuf files and maps ONNX operators through `tract-hir` into `tract-core` operators. The entry point for loading ONNX models.
+    - **`tract-onnx-opl`** — implements a small set of ONNX operators that have no equivalent in `tract-core`, and handles their serialization to and deserialization from OPL format. Depends only on `tract-core` and `tract-nnef`, keeping the runtime footprint small.
+  </Accordion>
+
+  <Accordion title="tract-tensorflow — TensorFlow 1.x frozen models">
+    Parses TensorFlow 1.x frozen protobuf models and maps TF operators to `tract-hir` / `tract-core`. Analogous in structure to `tract-onnx`. TF 2.x is not directly supported; those models should be converted to ONNX first.
+
+    <Note>The split between `tract-tensorflow` (parser + operator mapping) and a hypothetical `tract-tensorflow-opl` (ad-hoc operator implementations) has not yet been completed.</Note>
+  </Accordion>
+
+  <Accordion title="tract-tflite — TensorFlow Lite">
+    Provides basic support for loading TFLite FlatBuffer models via `tract-tflite`. Support is less complete than ONNX or TF1.
+  </Accordion>
+
+  <Accordion title="tract-pulse and tract-pulse-opl — streaming inference">
+    Implements the translation of a standard (batch) network into a **pulsing network** that processes a fixed-size chunk ("pulse") of a streaming input on each call. This is what powers real-time audio models such as wake-word detectors.
+
+    - **`tract-pulse`** — required at conversion time to rewrite the model graph.
+    - **`tract-pulse-opl`** — runtime support only; ships to embedded targets without the full conversion logic.
+
+    The same conversion/runtime split applies as with `tract-onnx-opl`: convert once with the CLI, ship only `tract-pulse-opl` at runtime.
+  </Accordion>
+
+  <Accordion title="tract (api/rs) — public Rust API facade">
+    The recommended entry point for Rust application code. Re-exports a stable, ergonomic API over the entire stack. Automatically activates the correct hardware backend (`tract-metal` on Apple platforms, `tract-cuda` on Linux/Windows when available) via `extern crate` declarations at the top of `lib.rs`.
+  </Accordion>
+</AccordionGroup>
+
+## Two usage patterns
+
+<Tabs>
+  <Tab title="Monolithic (development)">
+    Load an ONNX or TensorFlow model directly at startup. The full conversion pipeline — parsing, type inference, decluttering, optimization — runs every time the application starts.
+
+    ```
+    App binary
+    └── tract (api/rs)
+        ├── tract-onnx     (or tract-tensorflow)
+        ├── tract-hir
+        ├── tract-core
+        └── tract-linalg
+    ```
+
+    Best for: development, experimentation, and situations where startup time is not a constraint.
+
+    ```rust
+    use tract::prelude::*;
+
+    let model = onnx()?.load("model.onnx")?.into_model()?.into_runnable()?;
+    ```
+  </Tab>
+  <Tab title="Production (convert once, ship NNEF)">
+    Convert the model to tract-OPL once (using the `tract` CLI or offline tooling), then ship only the lightweight `tract-nnef` runtime. The heavy decluttering step has already been done; at startup only `into_optimized()` is needed.
+
+    ```
+    Conversion (offline, once):
+      tract-onnx + tract-hir + tract-core → tract-OPL archive
+
+    Runtime (shipped to device):
+    App binary
+    └── tract (api/rs)
+        ├── tract-nnef          (format parser, smaller than tract-onnx)
+        ├── tract-onnx-opl      (only if the model uses ONNX-specific ops)
+        ├── tract-pulse-opl     (only if the model is a streaming model)
+        ├── tract-core
+        └── tract-linalg
+    ```
+
+    Best for: embedded systems, mobile, edge deployment, or any situation where binary size and startup latency matter.
+
+    ```rust
+    use tract::prelude::*;
+
+    let model = nnef()?.load("model.nnef.tar")?    // already decluttered
+                       .into_runnable()?;           // lightweight optimization only
+    ```
+  </Tab>
+</Tabs>
+
+## tract-OPL
+
+tract-OPL (Operation Programming Language) is tract's production model format. It is a superset of NNEF:
+
+- **NNEF base** — the standardized inference format. Well-supported operators map directly to `tract-core`. Highly stable.
+- **OPL extensions** — proprietary extensions for operators not in the NNEF spec, including:
+  - Pulse/streaming operators (`tract-pulse-opl`)
+  - Recurrent operators such as `Scan`
+  - Symbolic dimension extensions
+  - ONNX operators with no `tract-core` equivalent (`tract-onnx-opl`)
+
+Any model understood by tract can be serialized to tract-OPL. This is a work in progress; coverage improves with each release.
+
+<Info>
+  tract-OPL files are machine-independent. A single `.nnef.tar` archive can be loaded on any supported platform; `into_optimized()` then selects the best platform-specific kernels at runtime.
+</Info>
+
+### Version compatibility
+
+| Rule | Detail |
+|---|---|
+| NNEF base | Follows the NNEF specification; highly stable. |
+| tract-OPL | Models produced by `tract 0.x.y` load correctly with `tract 0.x.z` where `z ≥ y`. |
+| Cross-minor breakage | Rare in practice. Notable: `0.16.3` (Scan operator), `0.17.0` (binary decision tree classifier). |
+
+Starting with `0.17.0`, a `tract_nnef_ser_version` property is embedded in every tract-OPL archive. Compatibility checking is the responsibility of the application; tract does not enforce it automatically.

@@ -1,0 +1,203 @@
+---
+title: "LLM inference"
+description: "Causal language model inference with KV-cache support"
+---
+
+This example shows how to run autoregressive text generation with a causal language model in tract. The `causal_llm` example includes a command-line completion tool, an OpenAI-compatible HTTP server, and a reusable `CausalLlmModel` library struct that handles KV-cache management and runtime selection automatically.
+
+The full source lives in [`examples/causal_llm`](https://github.com/sonos/tract/tree/main/examples/causal_llm) in the tract repository. Related ASR examples (which share the same KV-cache pattern) are in [`examples/nemo-parakeet-asr`](https://github.com/sonos/tract/tree/main/examples/nemo-parakeet-asr) and [`examples/nemo-nemotron-asr`](https://github.com/sonos/tract/tree/main/examples/nemo-nemotron-asr).
+
+<Warning>
+  LLM support in tract is actively developed. KV-cache transforms and quantization features are functional but considered experimental. API details may change between releases.
+</Warning>
+
+## Obtaining a model
+
+The example loads NNEF models (`.nnef.tgz`). A pre-quantized Qwen3-1.7B model is available for testing:
+
+```bash
+# 4-bit quantized Qwen3-1.7B NNEF model
+wget https://s3.amazonaws.com/tract-ci-builds/tests/llm/541/Qwen--Qwen3-1.7B-q40ef16/Qwen--Qwen3-1.7B-q40ef16.nnef.tgz
+
+# Matching tokenizer from HuggingFace
+wget https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/tokenizer.json
+```
+
+## Using the library
+
+The `CausalLlmModel` struct is the simplest entry point. It handles KV-cache detection, runtime selection (CUDA > Metal > CPU), and prompt chunking automatically:
+
+```rust src/main.rs
+use causal_llm::CausalLlmModel;
+
+fn main() -> anyhow::Result<()> {
+    // Load model and tokenizer
+    let llm = CausalLlmModel::from_paths("tokenizer.json", "model.nnef.tgz")?;
+
+    // Spawn a stateful generation session with an empty KV cache
+    let mut state = llm.spawn()?;
+
+    // Encode and append the prompt
+    state.append_text("The capital of France is")?;
+
+    // Generate tokens one at a time
+    for _ in 0..20 {
+        state.generate_next_token()?;
+    }
+
+    // Decode the full sequence (prompt + generated tokens)
+    let text = state.decode(&state.seq, true)?;
+    println!("{text}");
+    Ok(())
+}
+```
+
+## The two inference modes
+
+Causal LM inference alternates between two phases:
+
+<CardGroup>
+  <Card title="Prefill" icon="bolt">
+    Process the entire prompt in a single forward pass. All prompt tokens are fed in parallel, producing the initial KV cache and the logits for the first generated token.
+  </Card>
+  <Card title="Generation" icon="arrow-right">
+    Decode one token at a time. Each step takes a single token ID plus the accumulated KV cache, and returns updated logits and an extended cache.
+  </Card>
+</CardGroup>
+
+The `CausalLlmState` implementation handles both modes transparently. On the first call to `generate_next_token`, all unprocessed tokens (the prompt) are fed at once. Subsequent calls feed a single token each.
+
+For long prompts, chunked prefill is enabled by default (`prompt_chunk_size = 512`). This limits peak memory usage at the cost of slightly more forward passes.
+
+## KV-cache transforms
+
+Transformer models exported to ONNX or NNEF typically represent KV caches as opaque internal state. Tract exposes them as explicit model inputs and outputs using two transforms:
+
+<Steps>
+  <Step title="Detect transformer patterns">
+    `transformers_detect_all` scans the graph for attention patterns and inserts `DynKeyValueCache` ops:
+
+    ```rust
+    nn.transform("transformers_detect_all")?;
+    ```
+  </Step>
+
+  <Step title="Unfold KV caches into explicit I/O">
+    `unfold-kv-cache` converts each `DynKeyValueCache` op into a pair of explicit tensor inputs (past cache) and outputs (updated cache):
+
+    ```rust
+    nn.transform("unfold-kv-cache")?;
+    ```
+
+    After this transform, the model signature becomes:
+
+    ```
+    inputs:  [token_ids, kv_cache_0, kv_cache_1, ..., kv_cache_N]
+    outputs: [logits,    kv_cache_0, kv_cache_1, ..., kv_cache_N]
+    ```
+  </Step>
+
+  <Step title="Prepare for the selected runtime">
+    The transformed model is then compiled for the best available hardware:
+
+    ```rust
+    // Try runtimes in preference order
+    for rt_name in &["cuda", "metal", "default"] {
+        if let Ok(rt) = tract::runtime_for_name(rt_name) {
+            if let Ok(runnable) = rt.prepare(nn.clone()) {
+                break; // use this one
+            }
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Stateful generation with explicit KV caches
+
+Each call to `generate_next_token` passes the current KV caches as inputs and reads the updated caches from the outputs:
+
+```rust
+// Inside CausalLlmState::generate_next_token (simplified)
+let token_ids: Tensor = /* [1, chunk_len] i64 tensor */;
+
+// Build inputs: token tensor + all KV cache tensors
+let mut inputs: Vec<Tensor> = vec![token_ids];
+inputs.extend(self.kv_caches.iter().cloned());
+
+let mut results = self.model.nn.run(inputs)?;
+
+// Outputs: [logits, updated_kv_cache_0, ..., updated_kv_cache_N]
+let n_regular = self.model.n_regular_outputs; // typically 1 (logits)
+for (i, updated_kv) in results.drain(n_regular..).enumerate() {
+    self.kv_caches[i] = updated_kv;
+}
+
+let logits = results.remove(0);
+```
+
+<Info>
+  KV caches start as empty tensors with shape `[batch, heads, 0, head_dim]` (zero on the cache/sequence axis). They grow by one step on each `generate_next_token` call.
+</Info>
+
+## Running the binaries
+
+<CodeGroup>
+
+```bash Text completion (CLI)
+cargo run --bin complete --release -- \
+    -t tokenizer.json \
+    -m model.nnef.tgz \
+    -n 50 \
+    "The capital of France is"
+```
+
+```bash OpenAI-compatible server
+# Start the server
+cargo run --bin serve --release -- \
+    -t tokenizer.json \
+    -m model.nnef.tgz
+
+# Query it
+cargo run --bin client --release -- "The capital of France is"
+```
+
+</CodeGroup>
+
+The server listens on `http://0.0.0.0:3000/v1/completions` and accepts standard OpenAI completion requests.
+
+Additional options:
+
+| Flag | Description |
+| ---- | ----------- |
+| `-n <N>` | Number of tokens to generate (default: 20) |
+| `--force-cpu` | Disable CUDA/Metal and run on CPU only |
+
+## Weight quantization
+
+Pre-quantized models use Q4_0 block quantization (4-bit weights, f16 scale factors per block of 32 weights). This is the `q40ef16` suffix in the model filenames above.
+
+Quantization is applied offline before the NNEF model is packaged. It significantly reduces model size and memory bandwidth requirements, with a modest accuracy trade-off.
+
+<Note>
+  Q4_0 quantization for ARM64 is experimental. It is primarily tested on Qwen3 and Llama 3 architectures. Results on other model families may vary.
+</Note>
+
+## Prefix caching and truncation
+
+`CausalLlmState` supports truncating the KV cache back to an earlier sequence position. This is useful for branching generation or implementing prefix caching:
+
+```rust
+// Generate 5 tokens from "Hello world"
+state.append_text("Hello world")?;
+for _ in 0..5 {
+    state.generate_next_token()?;
+}
+
+// Truncate back to just the prompt, preserving the prompt's KV cache
+let prompt_len = state.encode("Hello world", true)?.len();
+state.truncate(prompt_len)?;
+
+// Continue generation from the same prefix without recomputing the prompt
+state.generate_next_token()?;
+```

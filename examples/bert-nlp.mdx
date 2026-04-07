@@ -1,0 +1,251 @@
+---
+title: "BERT / ALBERT for NLP"
+description: "Running transformer models for natural language processing with ONNX"
+---
+
+This example shows how to export a HuggingFace transformer model to ONNX and load it into tract for inference. The example uses ALBERT v2 for masked language modelling, but the same pattern applies to BERT, RoBERTa, and other encoder-style transformers.
+
+The full source lives in [`examples/pytorch-albert-v2`](https://github.com/sonos/tract/tree/main/examples/pytorch-albert-v2) in the tract repository.
+
+<Info>
+  Tokenization must happen outside of tract. Pass pre-tokenized integer IDs as `i64` tensors. Tract does not include a tokenizer; the example uses the HuggingFace `tokenizers` crate.
+</Info>
+
+## How it works
+
+<Steps>
+  <Step title="Export the model from HuggingFace to ONNX">
+    Use `torch.onnx.export` with dynamic axes so the exported model accepts variable sequence lengths and batch sizes:
+
+    ```python export.py
+    import os
+    import torch
+    from transformers import AutoModelForMaskedLM, AutoTokenizer
+    from torch.export import Dim
+
+    model_name = "albert-base-v2"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+
+    text = "Paris is the [MASK] of France."
+    inputs = tokenizer(text, return_tensors="pt")
+
+    input_ids      = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    token_type_ids = inputs["token_type_ids"]
+
+    batch = Dim("batch")
+    seq   = Dim("seq")
+
+    os.makedirs("./albert", exist_ok=True)
+    torch.onnx.export(
+        model,
+        (input_ids, attention_mask, token_type_ids),
+        "./albert/model.onnx",
+        input_names=["input_ids", "attention_mask", "token_type_ids"],
+        output_names=["logits"],
+        dynamic_shapes={
+            "input_ids":      (batch, seq),
+            "attention_mask": (batch, seq),
+            "token_type_ids": (batch, seq),
+        },
+    )
+    tokenizer.save_pretrained("./albert")
+    ```
+
+    ```bash
+    pip install torch transformers
+    python export.py
+    ```
+
+    This writes `albert/model.onnx` and `albert/tokenizer.json`.
+
+    <Tip>
+      You can also export transformer models with [Optimum](https://github.com/huggingface/optimum), which handles the dynamic axes automatically: `optimum-cli export onnx --model albert-base-v2 albert/`
+    </Tip>
+  </Step>
+
+  <Step title="Tokenize the input in Rust">
+    Tract does not include a tokenizer. Load the saved `tokenizer.json` with the `tokenizers` crate:
+
+    ```rust
+    use tokenizers::tokenizer::Tokenizer;
+
+    let tokenizer = Tokenizer::from_file("./albert/tokenizer.json")?;
+    let text = "Paris is the [MASK] of France.";
+    let encoding = tokenizer.encode(text, true)?;
+
+    let input_ids      = encoding.get_ids();           // &[u32]
+    let attention_mask = encoding.get_attention_mask(); // &[u32]
+    let token_type_ids = encoding.get_type_ids();       // &[u32]
+    ```
+  </Step>
+
+  <Step title="Build i64 tensors and run the model">
+    BERT-family models expect `i64` tensors. Cast from `u32` when building the arrays:
+
+    ```rust
+    use tract::prelude::*;
+    use tract_ndarray::s;
+
+    let length = input_ids.len();
+
+    let model = tract::onnx()?
+        .load("./albert/model.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    let ids = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        input_ids.iter().map(|&x| x as i64).collect(),
+    )?;
+    let mask = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        attention_mask.iter().map(|&x| x as i64).collect(),
+    )?;
+    let type_ids = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        token_type_ids.iter().map(|&x| x as i64).collect(),
+    )?;
+
+    let outputs = model.run((ids, mask, type_ids))?;
+    ```
+  </Step>
+
+  <Step title="Decode the result">
+    For masked LM, the output `logits` tensor has shape `[batch, seq_len, vocab_size]`. Slice to the `[MASK]` position and argmax to get the predicted token:
+
+    ```rust
+    let mask_pos = input_ids
+        .iter()
+        .position(|&x| x == tokenizer.token_to_id("[MASK]").unwrap())
+        .unwrap();
+
+    let logits = outputs[0].view::<f32>()?;
+    let logits = logits.slice(s![0, mask_pos, ..]);
+
+    let word_id = logits
+        .iter()
+        .zip(0u32..)
+        .max_by(|a, b| a.0.partial_cmp(b.0).unwrap())
+        .unwrap()
+        .1;
+
+    let word = tokenizer.id_to_token(word_id);
+    println!("Result: {word:?}");
+    // Result: Some("▁capital")
+    ```
+  </Step>
+</Steps>
+
+## Complete example
+
+<CodeGroup>
+
+```rust src/main.rs
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use tokenizers::tokenizer::{Result, Tokenizer};
+use tract::prelude::*;
+use tract_ndarray::s;
+
+fn main() -> Result<()> {
+    let model_dir = PathBuf::from_str("./albert")?;
+    let tokenizer = Tokenizer::from_file(Path::join(&model_dir, "tokenizer.json"))?;
+
+    let text = "Paris is the [MASK] of France.";
+    let encoding = tokenizer.encode(text, true)?;
+
+    let input_ids      = encoding.get_ids();
+    let attention_mask = encoding.get_attention_mask();
+    let token_type_ids = encoding.get_type_ids();
+    let length = input_ids.len();
+    let mask_pos = input_ids
+        .iter()
+        .position(|&x| x == tokenizer.token_to_id("[MASK]").unwrap())
+        .unwrap();
+
+    let model = tract::onnx()?
+        .load(Path::join(&model_dir, "model.onnx"))?
+        .into_model()?
+        .into_runnable()?;
+
+    let ids = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        input_ids.iter().map(|&x| x as i64).collect(),
+    )?;
+    let mask = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        attention_mask.iter().map(|&x| x as i64).collect(),
+    )?;
+    let type_ids = tract_ndarray::Array2::from_shape_vec(
+        (1, length),
+        token_type_ids.iter().map(|&x| x as i64).collect(),
+    )?;
+
+    let outputs = model.run((ids, mask, type_ids))?;
+    let logits = outputs[0].view::<f32>()?;
+    let logits = logits.slice(s![0, mask_pos, ..]);
+    let word_id = logits
+        .iter()
+        .zip(0u32..)
+        .max_by(|a, b| a.0.partial_cmp(b.0).unwrap())
+        .unwrap()
+        .1;
+    let word = tokenizer.id_to_token(word_id);
+    println!("Result: {word:?}");
+    Ok(())
+}
+```
+
+```toml Cargo.toml
+[dependencies]
+tract      = "*"
+tokenizers = "*"
+```
+
+</CodeGroup>
+
+## Dynamic sequence lengths
+
+When `torch.onnx.export` is called with `dynamic_shapes`, the exported model contains symbolic dimension names (`batch`, `seq`). Tract resolves these automatically at runtime — you do not need to re-optimize or re-compile the model for each input length.
+
+If you need to set the input shape explicitly before optimization (for example, to fix the batch size to 1 while keeping the sequence length symbolic), use `set_input_fact` on the `InferenceModel`:
+
+```rust
+use tract::prelude::*;
+
+let mut model = tract::onnx()?.load("albert/model.onnx")?;
+
+// Fix batch=1, leave sequence length as a free symbol
+let sym = model.symbol_table.sym("seq");
+let seq_len = TDim::from(sym);
+model.set_input_fact(
+    0,
+    InferenceFact::dt_shape(DatumType::I64, tvec![1.into(), seq_len.clone()]),
+)?;
+// ... repeat for other inputs ...
+
+let runnable = model.into_model()?.into_runnable()?;
+```
+
+<Warning>
+  Token IDs from HuggingFace tokenizers are `u32` but ONNX BERT models expect `i64`. Always cast before building the `Array2`.
+</Warning>
+
+## Running the example
+
+```bash
+# Export model (one-time)
+pip install torch transformers
+python export.py
+
+# Run inference
+cargo run --release
+```
+
+Expected output:
+
+```
+Result: Some("▁capital")
+```

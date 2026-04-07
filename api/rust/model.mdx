@@ -1,0 +1,168 @@
+---
+title: "Model"
+description: "The typed model type and its methods"
+---
+
+`Model` is the fully-typed, decluttered representation of a neural network graph. You obtain one either from `InferenceModel::into_model()` (ONNX path) or directly from `Nnef::load()`. A `Model` is ready for optimization via transforms and can be compiled into a `Runnable` for inference.
+
+<Info>
+  `Model` implements `Clone`, so you can hold a reference copy before calling the consuming `into_runnable()` if you need to serialize or inspect the model later.
+</Info>
+
+## Obtaining a Model
+
+```rust
+use tract::prelude::*;
+
+// From ONNX
+let model: Model = tract::onnx()?.load("model.onnx")?.into_model()?;
+
+// From NNEF
+let model: Model = tract::nnef()?.load("model.nnef.tgz")?;
+```
+
+## Inspecting inputs and outputs
+
+```rust
+let n_in  = model.input_count()?;   // usize
+let n_out = model.output_count()?;  // usize
+
+let name = model.input_name(0)?;    // String
+let name = model.output_name(0)?;   // String
+
+let fact: Fact = model.input_fact(0)?;
+let fact: Fact = model.output_fact(0)?;
+
+// Iterate all input facts
+for fact in model.input_facts()? {
+    println!("{fact}");   // e.g. "1,3,224,224,f32"
+}
+```
+
+`Fact` displays as a comma-separated spec string: dimensions followed by a dtype token, for example `1,3,224,224,f32`.
+
+## Compiling to a Runnable
+
+```rust
+let runnable: Runnable = model.into_runnable()?;
+```
+
+`into_runnable` prepares the model for CPU inference using the default runtime. It is a consuming operation. For GPU inference use `Runtime::prepare` instead.
+
+```rust
+// GPU / alternative runtime
+let runtime = tract::runtime_for_name("metal")?;   // Apple Metal
+let runnable = runtime.prepare(model)?;
+```
+
+## Applying transforms
+
+Transforms mutate the model in-place and re-declutter it afterward.
+
+```rust
+model.transform(spec)?;
+```
+
+<ParamField path="spec" type="impl Into<TransformSpec>" required>
+  A `TransformSpec`, a typed config struct (`ConcretizeSymbols`, `FloatPrecision`, `Pulse`), or a plain `&str` name from the transform registry.
+</ParamField>
+
+### Available transforms
+
+<AccordionGroup>
+  <Accordion title="ConcretizeSymbols — fix symbolic dimensions">
+    Replaces symbolic axis names with concrete integer values. Required when the model has dynamic shapes (e.g. a symbolic batch dimension `B`) and you want to compile to a fixed-size runnable.
+
+    ```rust
+    use tract::prelude::*;
+
+    // Fix the batch symbol "B" to 1
+    model.transform(ConcretizeSymbols::new().value("B", 1))?;
+    ```
+  </Accordion>
+  <Accordion title="FloatPrecision — change float dtype">
+    Casts all (or a subset of) floating-point operations from one dtype to another. Useful for running F32 models at F16 precision to reduce memory and improve throughput on hardware that supports F16.
+
+    ```rust
+    use tract::prelude::*;
+
+    // Downcast the whole model from f32 to f16
+    model.transform(FloatPrecision::new(DatumType::F32, DatumType::F16))?;
+
+    // Only convert nodes whose names match a pattern
+    model.transform(
+        FloatPrecision::new(DatumType::F32, DatumType::F16)
+            .include(vec!["matmul".into()])
+    )?;
+    ```
+
+    <Warning>
+      `FloatPrecision` only accepts float datum types (`F16`, `F32`, `F64`). Passing an integer type panics.
+    </Warning>
+  </Accordion>
+  <Accordion title="Pulse — streaming / pulsed execution">
+    Converts a model to streaming mode, processing a fixed-size pulse (chunk) of the input stream at a time. Required for low-latency audio or time-series inference.
+
+    ```rust
+    use tract::prelude::*;
+
+    // Process 128 frames at a time over the symbolic time axis "T"
+    model.transform(Pulse::new("128").symbol("T"))?;
+    ```
+  </Accordion>
+  <Accordion title="String-based transforms (advanced)">
+    You can also pass a plain `&str` name to look up a transform from the registry by name. This is an escape hatch for transforms that do not yet have a typed config struct.
+
+    ```rust
+    // KV-cache unfolding for LLMs
+    model.transform("unfold-kv-cache")?;
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Parsing a fact spec
+
+`parse_fact` converts a fact spec string into a `Fact` using the model's symbol table. Useful when you need a `Fact` value without querying an existing input or output.
+
+```rust
+let fact: Fact = model.parse_fact("1,3,224,224,f32")?;
+```
+
+Fact spec format: `dim0,dim1,...,dimN,dtype`. Symbolic dims may appear by name (e.g. `B,3,224,224,f32`).
+
+## Reading model properties
+
+Model properties are arbitrary named tensors embedded in the model file. They carry metadata such as vocabulary size, maximum sequence length, or training configuration.
+
+```rust
+let keys: Vec<String> = model.property_keys()?;
+
+for key in &keys {
+    let value: Tensor = model.property(key)?;
+    println!("{key}: {value}");
+}
+```
+
+## Full example: load, transform, and run
+
+```rust
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let mut model = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?;
+
+    // Fix symbolic batch dimension and downcast to f16
+    model.transform(ConcretizeSymbols::new().value("B", 1))?;
+    model.transform(FloatPrecision::new(DatumType::F32, DatumType::F16))?;
+
+    let runnable = model.into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<half::f16>::zeros((1, 3, 224, 224))
+        .try_into()?;
+    let outputs = runnable.run([input])?;
+    println!("output: {:?}", outputs[0].shape()?);
+    Ok(())
+}
+```

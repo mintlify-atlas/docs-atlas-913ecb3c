@@ -1,24 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
+  "projectType": "ai-ml",
+  "projectName": "tract",
+  "projectDescription": "A tiny, self-contained neural network inference engine for ONNX, TensorFlow, and NNEF models, optimized for edge and embedded deployment.",
   "theme": "aspen",
-  "name": "tract",
-  "colors": {
-    "primary": "#94cb04",
-    "light": "#545454",
-    "dark": "#94cb04"
-  },
-  "favicon": "https://media.brand.dev/288cc7c4-5cef-4376-950b-bdf0083eedae.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/sonos/tract"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/sonos/tract"
-    }
-  },
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -105,5 +92,39 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "ONNX inference with ~85% operator coverage",
+    "TensorFlow 1.x frozen model support",
+    "NNEF format for lightweight production deployment",
+    "GPU acceleration via CUDA (Linux/Windows) and Metal (Apple)",
+    "Optimized SIMD kernels for ARM (v6/v7/v8) and x86",
+    "Pulse/streaming mode for real-time audio processing",
+    "Multi-language API: Rust, Python, C/FFI",
+    "Embedded and edge-friendly with minimal runtime footprint",
+    "LLM inference support with transformer optimizations",
+    "Model cooking: optimize and serialize models to NNEF/OPL"
+  ],
+  "publicApiSurface": [
+    "tract::onnx() -> Onnx",
+    "tract::nnef() -> Nnef",
+    "tract::runtime_for_name(name) -> Runtime",
+    "Onnx::load(path) -> InferenceModel",
+    "Onnx::load_buffer(data) -> InferenceModel",
+    "InferenceModel::into_model() -> Model",
+    "Nnef::load(path) -> Model",
+    "Nnef::load_buffer(data) -> Model",
+    "Nnef::write_model_to_tar_gz(path, model)",
+    "Model::into_runnable() -> Runnable",
+    "Model::transform(spec) -> Result<()>",
+    "Runtime::prepare(model) -> Runnable",
+    "Runnable::run(inputs) -> Vec<Tensor>",
+    "Runnable::spawn_state() -> State",
+    "State::run(inputs) -> Vec<Tensor>",
+    "Tensor::from_bytes(dt, shape, data) -> Tensor",
+    "Tensor::as_bytes() -> (DatumType, &[usize], &[u8])",
+    "tract_onnx::onnx().model_for_path(path)",
+    "tract_nnef::nnef().model_for_path(path)",
+    "tract CLI: tract <model> -i <shape> [dump|bench|run|criterion]"
+  ]
 }

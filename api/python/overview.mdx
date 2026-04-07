@@ -1,0 +1,117 @@
+---
+title: "Python API overview"
+description: "Getting started with the tract Python bindings"
+---
+
+tract is a neural network inference engine written in Rust. The Python bindings wrap the native library via ctypes, giving you direct access to tract's loading, cooking, and inference pipeline.
+
+## Installation
+
+```bash
+pip install tract
+```
+
+## Import
+
+```python
+import tract
+```
+
+## Top-level functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `tract.onnx()` | `Onnx` | Create an ONNX loading context |
+| `tract.nnef()` | `Nnef` | Create a NNEF loading/saving context |
+| `tract.runtime_for_name(name)` | `Runtime` | Look up a named execution runtime |
+| `tract.version()` | `str` | Return the native library version string |
+
+## Key classes
+
+<CardGroup cols={2}>
+  <Card title="Onnx" href="/api/python/onnx">
+    Load ONNX models from file or bytes. Returns an `InferenceModel`.
+  </Card>
+  <Card title="Nnef" href="/api/python/nnef">
+    Load and save NNEF models. Returns a `Model`.
+  </Card>
+  <Card title="InferenceModel" href="/api/python/onnx">
+    Partially-typed model, used as the initial form of ONNX models. Set input facts then convert to `Model`.
+  </Card>
+  <Card title="Model" href="/api/python/model">
+    Fully-typed model ready for transformation and optimization. Convert to `Runnable` to execute.
+  </Card>
+  <Card title="Runnable" href="/api/python/model">
+    Optimized, executable model. Call `run()` with numpy arrays.
+  </Card>
+  <Card title="State" href="/api/python/model">
+    Mutable execution state for stateful (streaming) models.
+  </Card>
+  <Card title="Tensor" href="/api/python/tensor">
+    Multidimensional typed array. Interoperates with numpy.
+  </Card>
+  <Card title="Fact / InferenceFact" href="/api/python/tensor">
+    Shape and type descriptor for a tensor slot.
+  </Card>
+</CardGroup>
+
+## Quickstart
+
+<Steps>
+  <Step title="Load a model">
+    Load an ONNX file and convert it to a runnable model in one fluent chain:
+
+    ```python
+    import tract
+    import numpy
+
+    model = (
+        tract.onnx()
+        .load("./mobilenetv2-7.onnx")
+        .into_model()
+        .into_runnable()
+    )
+    ```
+  </Step>
+  <Step title="Prepare inputs">
+    Inputs are passed as a list of numpy arrays. tract converts them automatically:
+
+    ```python
+    grace_hopper = numpy.load("grace_hopper_1x3x224x244.npy")
+    ```
+  </Step>
+  <Step title="Run inference">
+    Call `run()` with the input list. Outputs are returned as a list of `Tensor` objects:
+
+    ```python
+    result = model.run([grace_hopper])
+    confidences = result[0].to_numpy()
+    assert numpy.argmax(confidences) == 652
+    ```
+  </Step>
+</Steps>
+
+## Working with numpy
+
+tract inputs and outputs interoperate with numpy transparently:
+
+- **Inputs** — pass `numpy.ndarray` objects directly to `run()`. tract converts them internally via `Tensor.from_numpy()`.
+- **Outputs** — `run()` returns a list of `Tensor` objects. Call `.to_numpy()` on any of them to get a `numpy.ndarray` back.
+
+```python
+import numpy
+
+# Input: numpy array -> Tensor (automatic)
+input_array = numpy.random.rand(1, 3, 224, 224).astype(numpy.float32)
+outputs = model.run([input_array])
+
+# Output: Tensor -> numpy array
+output_array = outputs[0].to_numpy()
+```
+
+## Checking the library version
+
+```python
+print(tract.version())
+# e.g. "0.21.7"
+```

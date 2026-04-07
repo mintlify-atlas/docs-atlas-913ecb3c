@@ -1,0 +1,230 @@
+---
+title: "Inference pipeline"
+description: "The four-stage pipeline from model file to prediction"
+---
+
+Running inference with tract involves four stages: load the model file, analyze and type the graph, optimize it for the target platform, and then execute it. Understanding where each stage sits — and its cost — helps you design efficient applications.
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │  Stage 1      Stage 2         Stage 3          Stage 4       │
+ │                                                              │
+ │  Load    →  Analyze/Type  →  Optimize     →   Run           │
+ │                                                              │
+ │  .onnx       InferenceModel   TypedModel       outputs       │
+ │  .nnef       → TypedModel     → Runnable                     │
+ └──────────────────────────────────────────────────────────────┘
+
+ ← heavy (done once, possibly offline) ──────→ ← lightweight → →
+```
+
+<Tip>
+  For production deployments, do stages 1–2 offline using the `tract` CLI to produce a tract-OPL archive. Ship only that archive to the device, where stages 3–4 run at startup and inference time respectively.
+</Tip>
+
+---
+
+## Stage 1 — Load
+
+The first stage parses the model file from disk (or from a byte buffer) and produces an in-memory model object. The exact type returned depends on the format:
+
+| Format | API call | Returns |
+|---|---|---|
+| ONNX | `onnx()?.load("model.onnx")?` | `InferenceModel` |
+| TF1 | `tensorflow().load("model.pb")?` | `InferenceModel` |
+| NNEF / tract-OPL | `nnef()?.load("model.nnef.tar.gz")?` | `Model` (TypedModel) |
+
+```rust
+use tract::prelude::*;
+
+// ONNX
+let inference_model = onnx()?.load("model.onnx")?;
+
+// NNEF (already typed — skips Stage 2)
+let typed_model = nnef()?.load("model.nnef.tar.gz")?;
+```
+
+NNEF/tract-OPL models skip Stage 2 because they are already in a fully-typed form close to `TypedModel`. This is the main reason the NNEF round-trip is so much faster than loading from ONNX or TF.
+
+---
+
+## Stage 2 — Analyze and type
+
+ONNX and TensorFlow models arrive as an `InferenceModel`: a graph where wire types and shapes may be partially or wholly unknown. Stage 2 resolves all of this into a `TypedModel`.
+
+### InferenceFact vs. TypedFact
+
+| | `InferenceFact` | `TypedFact` |
+|---|---|---|
+| Datum type | `Option<DatumType>` (may be unknown) | `DatumType` (always known) |
+| Shape | `Vec<Option<TDim>>` + rank flag (may be partial) | `Vec<TDim>` (fully resolved) |
+| Constant value | `Option<Arc<Tensor>>` | `Option<Arc<Tensor>>` |
+| Used in | `InferenceModel` | `TypedModel` |
+
+The **analyser** traverses the graph, calling `InferenceOp::infer()` on each node to propagate type and shape information forward (and sometimes backward) until all facts are fully determined.
+
+### Setting input facts
+
+For ONNX models that do not embed input shapes (common with dynamic batch dimensions), you must provide them before calling `into_model()`:
+
+```rust
+use tract::prelude::*;
+
+let mut inference_model = onnx()?.load("model.onnx")?;
+
+// Tell tract: input 0 is a batch of 1 image with shape [1, 3, 224, 224], f32
+inference_model.set_input_fact(0, "1,3,224,224,f32")?;
+
+let typed_model = inference_model.into_model()?;   // type + declutter
+```
+
+`into_model()` internally calls `into_typed()` (runs the analyser) followed by `into_decluttered()` (graph simplification: constant folding, dead-code elimination, operator fusion).
+
+---
+
+## Stage 3 — Optimize
+
+Stage 3 selects platform-specific compute kernels and performs any remaining platform-aware optimizations (e.g., choosing between NEON, AVX, or AVX-512 matrix multiplication routines).
+
+The default runtime (`DefaultRuntime`, exposed as `Model::into_runnable()`) selects CPU kernels automatically. For GPU runtimes see [Hardware backends](/concepts/hardware-backends).
+
+```rust
+// Using the default CPU runtime (implicit)
+let runnable: Runnable = typed_model.into_runnable()?;
+
+// Using a named runtime explicitly
+let runtime = runtime_for_name("cuda")?;
+let runnable: Runnable = runtime.prepare(typed_model)?;
+```
+
+The result is a `Runnable`: a fully prepared, immutable plan ready for execution. `Runnable` implements `Clone` and is cheap to share across threads.
+
+---
+
+## Stage 4 — Run
+
+A `Runnable` produces outputs from inputs. There are two execution modes:
+
+<Tabs>
+  <Tab title="Stateless (feedforward models)">
+    For models without recurrent state (CNNs, Transformers, etc.), call `run()` directly on the `Runnable`. It creates a transient `State` internally, runs the graph, and discards the state.
+
+    ```rust
+    use tract::prelude::*;
+    use tract_ndarray::Array;
+
+    // Build a 1×3×224×224 input tensor (NCHW layout)
+    let input = Array::from_shape_fn((1, 3, 224, 224), |_| 0.0f32);
+    let input_tensor = tensor(input)?;
+
+    let outputs = model.run([input_tensor])?;
+
+    let output_array = outputs[0].to_array_view::<f32>()?;
+    println!("top class: {}", output_array.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0);
+    ```
+  </Tab>
+  <Tab title="Stateful (RNNs, LSTMs)">
+    RNN and LSTM models carry hidden state between calls. Use `spawn_state()` to get a `State` object, then call `state.run()` repeatedly. Each call updates the internal state.
+
+    ```rust
+    use tract::prelude::*;
+
+    let runnable: Runnable = /* ... model loading and optimization ... */;
+
+    // Spawn a stateful session — hidden state is zeroed on construction
+    let mut state = runnable.spawn_state()?;
+
+    for frame in audio_frames {
+        let input = tensor(frame)?;
+        let output = state.run([input])?;  // hidden state persists between calls
+        process(output);
+    }
+
+    // To reset the model state, drop and re-spawn:
+    let mut state = runnable.spawn_state()?;
+    ```
+
+    Because `Runnable` is `Clone`, you can spawn multiple independent states from the same compiled model — useful for batching separate audio streams.
+  </Tab>
+</Tabs>
+
+---
+
+## Full pipeline example
+
+<Steps>
+  <Step title="Add tract to Cargo.toml">
+    ```toml
+    [dependencies]
+    tract = "0.23"
+    ```
+  </Step>
+
+  <Step title="Load and prepare the model">
+    ```rust
+    use tract::prelude::*;
+
+    fn build_model() -> Result<Runnable> {
+        let model = onnx()?                              // Stage 1: create ONNX parser
+            .load("model.onnx")?                         // Stage 1: parse file → InferenceModel
+            .set_input_fact(0, "1,3,224,224,f32")        // Stage 2: provide input shape
+            .into_model()?                               // Stage 2: type + declutter → TypedModel
+            .into_runnable()?;                           // Stage 3: optimize → Runnable
+        Ok(model)
+    }
+    ```
+  </Step>
+
+  <Step title="Run inference">
+    ```rust
+    use tract::prelude::*;
+    use tract_ndarray::Array4;
+
+    fn infer(model: &Runnable, image: Array4<f32>) -> Result<usize> {
+        let input = tensor(image)?;
+        let outputs = model.run([input])?;               // Stage 4: execute
+
+        let scores = outputs[0].to_array_view::<f32>()?;
+        let top_class = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        Ok(top_class)
+    }
+    ```
+  </Step>
+
+  <Step title="(Optional) Save to tract-OPL for faster startup">
+    ```rust
+    use tract::prelude::*;
+
+    // Load and type the model (Stages 1–2)
+    let typed_model = onnx()?.load("model.onnx")?.into_model()?;
+
+    // Write to tract-OPL (do this once, store the .tar.gz)
+    let framework = nnef()?;
+    framework.write_model_to_tar_gz("model.nnef.tar.gz", &typed_model)?;
+
+    // Later, at runtime — Stages 1 and 3 only (Stage 2 is already done)
+    let fast_model = nnef()?.load("model.nnef.tar.gz")?.into_runnable()?;
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Pipeline cost summary
+
+| Stage | When it runs | Relative cost | Notes |
+|---|---|---|---|
+| Load | Every startup (or once offline) | Medium | Parsing + protobuf decode |
+| Analyze / Type | Every startup (or once offline) | **High** | Shape inference, declutter, operator fusion |
+| Optimize | Every startup | Low–Medium | Platform kernel selection; lighter than Stage 2 |
+| Run | Every inference call | Very low | Pure computation |
+
+<Info>
+  The Analyze/Type stage (Stage 2) is the most expensive. Doing it offline with the `tract` CLI and shipping a tract-OPL archive eliminates it entirely from the production startup path.
+</Info>

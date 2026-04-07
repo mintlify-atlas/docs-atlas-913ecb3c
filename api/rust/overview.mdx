@@ -1,0 +1,133 @@
+---
+title: "Rust API overview"
+description: "Getting started with the tract Rust API"
+---
+
+The `tract` crate is the recommended public-facing facade for building Rust applications with tract. As of version 0.23 it provides a stable, versioned API that shields you from internal churn.
+
+<Note>
+  0.23 is the first version with a stable public API facade. Earlier versions exposed internals directly and are not covered here.
+</Note>
+
+## Installation
+
+Add the following to your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+tract = "0.23"
+anyhow = "1"
+```
+
+## Importing the prelude
+
+All public types are re-exported from `tract::prelude`. Start every file with:
+
+```rust
+use tract::prelude::*;
+```
+
+## Key types
+
+<Columns cols={2}>
+  <Card title="Framework / loader types" icon="box">
+    - `Onnx` — ONNX parser and loader
+    - `Nnef` — NNEF parser, loader, and writer
+    - `Runtime` — hardware-specific execution backend
+  </Card>
+  <Card title="Model types" icon="layers">
+    - `InferenceModel` — partially-typed model returned by `Onnx::load`
+    - `Model` — fully-typed, decluttered model ready for optimization
+  </Card>
+  <Card title="Execution types" icon="play">
+    - `Runnable` — compiled model ready for CPU inference
+    - `State` — stateful session for RNNs and streaming
+  </Card>
+  <Card title="Data types" icon="database">
+    - `Tensor` — n-dimensional data buffer
+    - `Fact` — typed shape + dtype descriptor for `Model`
+    - `InferenceFact` — partial descriptor for `InferenceModel`
+    - `Dim` — concrete or symbolic axis size
+    - `DatumType` — element type enum
+  </Card>
+  <Card title="Transform types" icon="sliders">
+    - `TransformSpec` — opaque transform handle
+    - `ConcretizeSymbols` — fix symbolic dims to concrete values
+    - `FloatPrecision` — change float precision (F16/F32/F64)
+    - `Pulse` — convert model to streaming/pulsed mode
+  </Card>
+</Columns>
+
+## Entry point functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `tract::onnx()` | `Result<Onnx>` | Create an ONNX parser |
+| `tract::nnef()` | `Result<Nnef>` | Create a NNEF parser |
+| `tract::runtime_for_name(name)` | `Result<Runtime>` | Look up a named hardware runtime (e.g. GPU) |
+
+## Typical workflow
+
+The standard path from a file on disk to inference results:
+
+<Steps>
+  <Step title="Create a framework instance">
+    Call `tract::onnx()?` or `tract::nnef()?` to get a loader.
+  </Step>
+  <Step title="Load the model">
+    Call `.load("model.onnx")?` to get an `InferenceModel` (ONNX) or `Model` (NNEF).
+  </Step>
+  <Step title="Convert to a typed model">
+    For ONNX, call `.into_model()?` to produce a fully-typed `Model`.
+  </Step>
+  <Step title="Compile to a runnable">
+    Call `.into_runnable()?` to produce an optimized `Runnable`.
+  </Step>
+  <Step title="Run inference">
+    Call `runnable.run([input_tensor])?` and consume the output `Vec<Tensor>`.
+  </Step>
+</Steps>
+
+```rust
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let model = tract::onnx()?
+        .load("model.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    // build an input tensor (shape 1×3×224×224, f32)
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+
+    let result = model.run([input])?;
+
+    // result[0] is a Tensor; access the raw f32 values:
+    let scores = result[0].as_slice::<f32>()?;
+    println!("output shape: {:?}", result[0].shape()?);
+    println!("first score: {}", scores[0]);
+
+    Ok(())
+}
+```
+
+## What's next
+
+<Columns cols={2}>
+  <Card title="Onnx" icon="file" href="/api/rust/onnx">
+    Load ONNX models from disk or a byte buffer.
+  </Card>
+  <Card title="Nnef" icon="archive" href="/api/rust/nnef">
+    Load and save models in compact NNEF format.
+  </Card>
+  <Card title="Model" icon="layers" href="/api/rust/model">
+    Apply transforms and inspect typed model facts.
+  </Card>
+  <Card title="Runnable and State" icon="play" href="/api/rust/runnable">
+    Run inference, profile performance, and manage stateful sessions.
+  </Card>
+  <Card title="Tensor, Fact, and DatumType" icon="database" href="/api/rust/tensor">
+    Create tensors, read outputs, and work with shapes and dtypes.
+  </Card>
+</Columns>

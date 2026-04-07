@@ -1,0 +1,175 @@
+---
+title: "Stable Diffusion"
+description: "Image generation with Stable Diffusion using tract"
+---
+
+This example shows how to run a complete text-to-image diffusion pipeline in Rust using tract. Each stage of the pipeline is an independent ONNX model: a CLIP text encoder, a U-Net denoiser, and a VAE decoder. All three run on GPU via tract's CUDA backend.
+
+The full source lives in [`examples/stable-diffusion`](https://github.com/sonos/tract/tree/main/examples/stable-diffusion) in the tract repository. Variants for Stable Diffusion XL and SD3 are in [`examples/stable-diffusion-xl`](https://github.com/sonos/tract/tree/main/examples/stable-diffusion-xl) and [`examples/stable-diffusion-3`](https://github.com/sonos/tract/tree/main/examples/stable-diffusion-3).
+
+## Pipeline overview
+
+```
+Prompt → [Tokenizer] → [CLIP Text Encoder] → text embeddings
+                                                    ↓
+Random noise → [Euler Scheduler + UNet × steps] → denoised latent
+                                                    ↓
+                              [VAE Decoder] → 512×512 RGB image
+```
+
+| Stage | Model | Notes |
+| ----- | ----- | ----- |
+| Text encoding | CLIP ViT-L/14 | 77-token sequence → 768-dim embeddings |
+| Denoising | SD 1.5 U-Net | Dynamic batch axis for classifier-free guidance |
+| Decoding | SD 1.5 VAE | Latent space (4×64×64) → pixel space (3×512×512) |
+
+## Setup
+
+<Steps>
+  <Step title="Install Python dependencies and export ONNX models">
+    The `export.py` script downloads the SD 1.5 weights from HuggingFace diffusers and exports each component to ONNX:
+
+    ```bash
+    pip install torch diffusers transformers accelerate onnxscript onnx Pillow
+    python export.py
+    ```
+
+    This writes `assets/text_encoder.onnx`, `assets/unet.onnx`, `assets/vae_decoder.onnx`, and `assets/tokenizer/tokenizer.json`.
+  </Step>
+
+  <Step title="Generate an image">
+    ```bash
+    cargo run --release -- -p "a photo of a cat" -o cat.png
+    ```
+
+    Run `cargo run --release -- --help` for all options:
+
+    | Option | Default | Description |
+    | ------ | ------- | ----------- |
+    | `-p, --prompt` | `"a photo of a cat"` | Text prompt |
+    | `-n, --num-images` | `1` | Number of images to generate |
+    | `-s, --steps` | `20` | Denoising steps |
+    | `--seed` | `42` | Random seed |
+    | `-g, --guidance-scale` | `7.5` | Classifier-free guidance scale |
+    | `-o, --output` | `output.png` | Output file |
+    | `--assets` | `assets` | Model directory |
+  </Step>
+</Steps>
+
+## How the pipeline works in Rust
+
+Each model is loaded independently and can be placed on GPU with `runtime.prepare()`:
+
+```rust src/main.rs
+use tract::prelude::*;
+
+// Select best available runtime: CUDA > Metal > CPU
+let gpu = ["cuda", "metal", "default"]
+    .iter()
+    .find_map(|rt| tract::runtime_for_name(rt).ok())
+    .unwrap();
+
+let onnx = tract::onnx()?;
+let text_encoder = gpu.prepare(onnx.load(assets.join("text_encoder.onnx"))?.into_model()?)?;
+let unet         = gpu.prepare(onnx.load(assets.join("unet.onnx"))?.into_model()?)?;
+let vae_decoder  = gpu.prepare(onnx.load(assets.join("vae_decoder.onnx"))?.into_model()?)?;
+```
+
+### Step 1: Text encoding
+
+Tokenize the prompt (padded/truncated to 77 tokens) and run the CLIP encoder. For classifier-free guidance, encode both the real prompt and an empty unconditional prompt:
+
+```rust
+// Encode prompt and empty string
+let cond_emb   = text_encoder.run([input_ids])?;
+let uncond_emb = text_encoder.run([uncond_input_ids])?;
+
+// Concatenate for CFG: [uncond × N, cond × N] → shape (2N, 77, 768)
+let text_emb = tract_ndarray::concatenate(
+    tract_ndarray::Axis(0),
+    &[uncond_emb[0].view::<f32>()?, cond_emb[0].view::<f32>()?],
+)?;
+```
+
+### Step 2: Iterative denoising
+
+Run the U-Net for `num_steps` iterations. Each step uses an Euler discrete scheduler to compute the noise estimate and update the latents:
+
+```rust
+for (i, &t) in scheduler.timesteps.iter().enumerate() {
+    // Scale latents by current sigma
+    let sample = /* [2N, 4, 64, 64] tensor */;
+    let timestep = /* [2N] tensor with value t */;
+
+    let noise_pred = unet.run(vec![
+        tensor(sample)?,
+        tensor(timestep)?,
+        tensor(text_emb.clone())?,
+    ])?;
+
+    // Classifier-free guidance: combine uncond and cond predictions
+    // eps = uncond + guidance_scale * (cond - uncond)
+    let dt = scheduler.dt(i);
+    for j in 0..latents.len() {
+        let u = noise_pred_uncond[j];
+        let c = noise_pred_cond[j];
+        latents[j] += (u + guidance_scale * (c - u)) * dt;
+    }
+}
+```
+
+### Step 3: VAE decoding
+
+Scale the latents by the VAE scaling factor and decode to pixels:
+
+```rust
+// VAE scaling factor for SD 1.5 is 0.18215
+let img_latent: Vec<f32> = latents.iter().map(|&x| x / 0.18215).collect();
+let latent_arr = tract_ndarray::ArrayD::from_shape_vec(vec![1, 4, 64, 64], img_latent)?;
+let image_result = vae_decoder.run([latent_arr])?;
+// image_result[0] is a [1, 3, 512, 512] float tensor in [-1, 1]
+```
+
+## Performance
+
+On an NVIDIA GPU with 32 GB VRAM:
+
+| Images | Steps | Time | Notes |
+| ------ | ----- | ---- | ----- |
+| 1 | 20 | ~8 s | Single image |
+| 4 | 20 | ~20 s | Batched U-Net, ~5 s/image |
+| 1 | 10 | ~5 s | Fewer steps, lower quality |
+
+<Tip>
+  GPU inference is essential for diffusion models. Running all three models on CUDA (or Metal on macOS) gives the best throughput. The U-Net uses batched inference for classifier-free guidance (batch = 2N for N images), which keeps GPU utilization high.
+</Tip>
+
+## Memory considerations
+
+Because each model is a separate ONNX file loaded independently, you can control memory precisely:
+
+<CardGroup>
+  <Card title="Load on demand" icon="download">
+    Load each model only when needed and drop it immediately after. The text encoder only runs once; you can release it before the denoising loop.
+  </Card>
+  <Card title="Independent GPU buffers" icon="server">
+    Each call to `runtime.prepare()` allocates separate GPU memory. Models do not share buffers, so they can be loaded and unloaded independently.
+  </Card>
+  <Card title="Batching" icon="layer-group">
+    The U-Net supports a dynamic batch axis. Generating N images requires only one model file; tract resolves the batch size at runtime.
+  </Card>
+</CardGroup>
+
+## Available variants
+
+<CardGroup>
+  <Card title="Stable Diffusion 1.5" icon="image" href="https://github.com/sonos/tract/tree/main/examples/stable-diffusion">
+    The baseline example. 512×512 images, three-model pipeline.
+  </Card>
+  <Card title="Stable Diffusion XL" icon="image" href="https://github.com/sonos/tract/tree/main/examples/stable-diffusion-xl">
+    Higher resolution (1024×1024) with a two-stage U-Net (base + refiner).
+  </Card>
+  <Card title="Stable Diffusion 3" icon="image" href="https://github.com/sonos/tract/tree/main/examples/stable-diffusion-3">
+    SD3 architecture with a multi-modal diffusion transformer (MMDiT).
+  </Card>
+</CardGroup>

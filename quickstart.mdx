@@ -1,80 +1,169 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: 'Quickstart'
+description: 'Run MobileNet v2 image classification with tract in Rust or Python.'
 ---
 
-## Get started in three steps
+This guide walks through a complete inference example using MobileNet v2 and ONNX. You will load a model, prepare an input tensor, run inference, and read the result.
 
-Get your documentation site running locally and make your first customization.
+<Tabs>
+  <Tab title="Rust">
+    <Steps>
+      <Step title="Add the dependency">
+        Add tract to your `Cargo.toml`:
 
-### Step 1: Set up your local environment
+        ```toml Cargo.toml
+        [dependencies]
+        tract = "0.23"
+        anyhow = "1"
+        image = "0.25"
+        ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+        <Tip>
+          tract re-exports `ndarray` as `tract_ndarray` so you do not need to add it separately.
+        </Tip>
+      </Step>
 
-### Step 2: Deploy your changes
+      <Step title="Download the model">
+        Download the MobileNet v2 ONNX model from the ONNX Model Zoo:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+        ```bash
+        wget https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx
+        wget https://github.com/sonos/tract/raw/main/examples/onnx-mobilenet-v2/grace_hopper.jpg
+        ```
+      </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+      <Step title="Run inference">
+        Replace the contents of `src/main.rs` with the following:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+        ```rust src/main.rs
+        use anyhow::Result;
+        use tract::prelude::*;
 
-### Step 3: Go live
+        fn main() -> Result<()> {
+            // Load and optimize the model
+            let model = tract::onnx()?
+                .load("mobilenetv2-7.onnx")?
+                .into_model()?
+                .into_runnable()?;
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+            // Open the image, resize to 224×224
+            let image = image::open("grace_hopper.jpg").unwrap().to_rgb8();
+            let resized = image::imageops::resize(
+                &image,
+                224,
+                224,
+                ::image::imageops::FilterType::Triangle,
+            );
+
+            // Normalize and build the input tensor (NCHW, ImageNet stats)
+            let input = tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
+                let mean = [0.485, 0.456, 0.406][c];
+                let std = [0.229, 0.224, 0.225][c];
+                (resized[(x as _, y as _)][c] as f32 / 255.0 - mean) / std
+            });
+
+            // Run the model
+            let result = model.run([input])?;
+
+            // Find the class with the highest confidence
+            let best = result[0]
+                .as_slice::<f32>()?
+                .iter()
+                .zip(2..)
+                .max_by(|a, b| a.0.partial_cmp(b.0).unwrap());
+            println!("result: {best:?}");
+            Ok(())
+        }
+        ```
+
+        Run it:
+
+        ```bash
+        cargo run --release
+        ```
+
+        You should see output like `result: Some((0.9423, 653))`, where 652–653 is the ImageNet class for "military uniform".
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Python">
+    <Steps>
+      <Step title="Install the package">
+        ```bash
+        pip install tract numpy
+        ```
+      </Step>
+
+      <Step title="Download the model">
+        ```bash
+        wget https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx
+        ```
+
+        You also need a pre-processed input array. The tract repository includes one:
+
+        ```bash
+        wget https://github.com/sonos/tract/raw/main/api/py/tests/grace_hopper_1x3x224x244.npy
+        ```
+      </Step>
+
+      <Step title="Run inference">
+        ```python inference.py
+        import tract
+        import numpy
+
+        # Load and optimize the model
+        model = (
+            tract.onnx()
+            .load("./mobilenetv2-7.onnx")
+            .into_model()
+            .into_runnable()
+        )
+
+        # Load the pre-processed input (shape: 1×3×224×224, dtype: float32)
+        grace_hopper = numpy.load("grace_hopper_1x3x224x244.npy")
+
+        # Run inference
+        result = model.run([grace_hopper])
+
+        # result[0] is a numpy array of class confidences
+        confidences = result[0].to_numpy()
+
+        # Class 652 is "military uniform" in ImageNet
+        assert numpy.argmax(confidences) == 652
+        print(f"Predicted class: {numpy.argmax(confidences)}")
+        ```
+
+        Run it:
+
+        ```bash
+        python inference.py
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## What just happened
+
+The inference pipeline follows the same pattern in both languages:
+
+1. **`onnx().load(...)`** — parses the `.onnx` protobuf file and produces an `InferenceModel`
+2. **`.into_model()`** — runs type inference and translates to tract's typed intermediate representation (`TypedModel`), stripping training artefacts
+3. **`.into_runnable()`** — applies platform-specific optimizations and produces an executable plan
+4. **`model.run([input])`** — executes the plan and returns output tensors
+
+<Info>
+The `into_model()` → `into_runnable()` split lets you serialize the typed model to NNEF for faster startup on embedded targets, loading only the lightweight `tract-nnef` runtime instead of the full ONNX parser.
+</Info>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation" icon="package" href="/installation">
+    Feature flags, MSRV requirements, and CLI setup.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Architecture overview and supported model formats.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

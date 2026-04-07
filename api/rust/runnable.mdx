@@ -1,0 +1,219 @@
+---
+title: "Runnable and State"
+description: "Running inference with Runnable and State"
+---
+
+`Runnable` is the compiled, ready-to-execute form of a model. You get it by calling `Model::into_runnable()` or `Runtime::prepare()`. `State` is a stateful session spawned from a `Runnable` that preserves internal tensor state across successive calls — required for RNNs, LSTMs, and streaming (pulsed) models.
+
+## Runnable
+
+### Obtaining a Runnable
+
+```rust
+use tract::prelude::*;
+
+// Default CPU runtime
+let runnable: Runnable = model.into_runnable()?;
+
+// Named hardware runtime (e.g. Apple Metal)
+let runtime = tract::runtime_for_name("metal")?;
+let runnable: Runnable = runtime.prepare(model)?;
+```
+
+`Runnable` implements `Send + Sync + Clone`, so you can share it across threads (for example, a web server handling concurrent requests).
+
+### Stateless inference
+
+```rust
+let outputs: Vec<Tensor> = runnable.run([input_tensor])?;
+```
+
+`run` accepts any type implementing `IntoInputs<Tensor>`:
+- `[tensor]` — array literal (one or more tensors)
+- `(tensor_a, tensor_b)` — tuple (up to 8 elements, each independently convertible)
+- `Vec<Tensor>` — pre-built vector
+- Any array/tuple whose elements implement `TryInto<Tensor>`
+
+<Note>
+  `Runnable::run` is a convenience wrapper. Internally it creates a `State`, runs it once, and drops the state. If you call it in a loop it allocates a new state on every call. For repeated stateless inference this is fine; for RNNs or streaming use `spawn_state()` instead.
+</Note>
+
+### Inspecting inputs and outputs
+
+```rust
+let n_in  = runnable.input_count()?;
+let n_out = runnable.output_count()?;
+
+let in_fact:  Fact = runnable.input_fact(0)?;
+let out_fact: Fact = runnable.output_fact(0)?;
+
+// Iterate all input facts
+for fact in runnable.input_facts()? {
+    println!("{fact}");
+}
+```
+
+### Reading model properties
+
+```rust
+let keys: Vec<String> = runnable.property_keys()?;
+let value: Tensor     = runnable.property("vocab_size")?;
+```
+
+### Performance introspection
+
+<AccordionGroup>
+  <Accordion title="cost_json — per-op cost estimate">
+    Returns a JSON string with the estimated FLOPs, memory bandwidth, and other cost metrics for each node. No inputs are needed — costs are computed analytically from the model graph.
+
+    ```rust
+    let json: String = runnable.cost_json()?;
+    println!("{json}");
+    ```
+
+    <Note>
+      `cost_json` only works on `TypedModel`-based runnables (the default CPU runtime). It returns an error for GPU runnables.
+    </Note>
+  </Accordion>
+  <Accordion title="profile_json — measured wall-clock profile">
+    Runs the model with real input tensors and returns wall-clock timing per node as JSON.
+
+    ```rust
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+
+    let json: String = runnable.profile_json(Some([input]))?;
+    println!("{json}");
+    ```
+
+    Pass `None::<Vec<Tensor>>` to get cost estimates only, without profiling:
+
+    ```rust
+    let json: String = runnable.profile_json(None::<Vec<Tensor>>)?;
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Spawning a stateful session
+
+```rust
+let mut state: State = runnable.spawn_state()?;
+```
+
+## State
+
+`State` holds the internal tensor buffers that persist between `run` calls. This is what makes RNNs and streaming models work correctly.
+
+### Running with state
+
+```rust
+let outputs: Vec<Tensor> = state.run([input_tensor])?;
+```
+
+The signature is identical to `Runnable::run`, but internal buffers (hidden states, KV-cache entries, etc.) survive from one call to the next.
+
+### Inspecting state I/O
+
+```rust
+let n_in  = state.input_count()?;
+let n_out = state.output_count()?;
+```
+
+## Runnable::run vs State::run
+
+| | `Runnable::run` | `State::run` |
+|---|---|---|
+| Internal state | Discarded after each call | Preserved across calls |
+| Use case | Stateless models (CNNs, ViTs) | RNNs, LSTMs, streaming models |
+| Allocation | Creates and drops a `State` per call | Reuses existing buffers |
+| Thread safety | Can be called from multiple threads simultaneously | Requires exclusive (`&mut`) access |
+
+## Examples
+
+<CodeGroup>
+
+```rust Stateless CNN inference
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let runnable = tract::onnx()?
+        .load("mobilenetv2-7.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+        .try_into()?;
+
+    let outputs = runnable.run([input])?;
+    let scores = outputs[0].as_slice::<f32>()?;
+    let best = scores.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap());
+    println!("class: {best:?}");
+    Ok(())
+}
+```
+
+```rust Stateful LSTM / streaming
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let runnable = tract::onnx()?
+        .load("rnn_model.onnx")?
+        .into_model()?
+        .into_runnable()?;
+
+    let mut state = runnable.spawn_state()?;
+
+    // Process a sequence of audio frames one at a time.
+    // The hidden state is preserved between calls.
+    for frame in audio_frames() {
+        let outputs = state.run([frame])?;
+        // outputs[0] is the model output for this frame
+        process_frame_output(&outputs[0])?;
+    }
+    Ok(())
+}
+
+fn audio_frames() -> impl Iterator<Item = Tensor> {
+    // placeholder: yield 100 random 1×128 frames
+    (0..100).map(|_| {
+        tract_ndarray::Array2::<f32>::zeros((1, 128))
+            .try_into()
+            .unwrap()
+    })
+}
+
+fn process_frame_output(_t: &Tensor) -> anyhow::Result<()> {
+    Ok(())
+}
+```
+
+```rust Multi-threaded inference (shared Runnable)
+use std::sync::Arc;
+use tract::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    let runnable = Arc::new(
+        tract::onnx()?
+            .load("model.onnx")?
+            .into_model()?
+            .into_runnable()?
+    );
+
+    let handles: Vec<_> = (0..4).map(|i| {
+        let runnable = Arc::clone(&runnable);
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            let input: Tensor = tract_ndarray::Array4::<f32>::zeros((1, 3, 224, 224))
+                .try_into()?;
+            let outputs = runnable.run([input])?;
+            println!("thread {i}: {:?}", outputs[0].shape()?);
+            Ok(())
+        })
+    }).collect();
+
+    for h in handles { h.join().unwrap()?; }
+    Ok(())
+}
+```
+
+</CodeGroup>

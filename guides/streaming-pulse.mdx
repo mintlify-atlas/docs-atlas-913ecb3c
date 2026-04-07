@@ -1,0 +1,214 @@
+---
+title: "Streaming inference (pulse mode)"
+description: "Process continuous audio or signal streams frame-by-frame with tract's pulse transform."
+---
+
+Most neural network models are designed around batch inference: they take a complete, fixed-length input and produce a complete output. In streaming applications — wake-word detection, automatic speech recognition, real-time audio effects — you receive signal continuously and need to produce outputs with low latency, processing each incoming frame as it arrives.
+
+tract's **pulse mode** converts a batch-oriented model into a streaming model that processes a fixed-size window (a *pulse*) at each step while maintaining internal state across calls.
+
+<Info>
+  Snips (now Sonos) uses pulse mode in production to run WaveNet-based wake-word detectors on Raspberry Pi Zero hardware. WaveNet's recurrent structure required streaming inference to achieve acceptable latency on embedded CPUs.
+</Info>
+
+## How pulse mode works
+
+The `Pulse` transform rewrites the model graph:
+
+1. Identifies the streaming axis (typically the time or sequence axis, denoted by a symbol like `S` or `T`)
+2. Folds all operators that look "backward" in time (convolutions, RNNs, sliding windows) into stateful operators that hold the necessary delay buffers
+3. Replaces the variable-length streaming axis with a fixed pulse size
+
+The resulting model takes a `[batch, pulse_size, ...]` input and produces a correspondingly sized output each call. State (delay buffers, RNN hidden activations) persists inside a `State` object across calls.
+
+<Warning>
+  The model **must be causal** — it must not look forward in time beyond the current pulse. Non-causal models (e.g. BiLSTM, models with future context) cannot be converted to pulse mode without modification.
+</Warning>
+
+## Applying the Pulse transform
+
+<Steps>
+  <Step title="Load the model and set input facts">
+    Set input facts before applying the Pulse transform. tract needs concrete dtype information and a symbolic dimension that identifies the streaming axis.
+
+    ```rust
+    use tract::prelude::*;
+
+    let mut model = tract::onnx()?
+        .load("wake_word.onnx")?
+        .into_model()?;
+    ```
+
+    If the ONNX model already uses a symbolic dimension for the time axis (e.g. `S`), tract preserves it. If your model has a fixed sequence length, replace it with a symbol when setting the input fact on the `InferenceModel`:
+
+    ```rust
+    let mut inference_model = tract::onnx()?.load("wake_word.onnx")?;
+    // Replace the sequence dimension with symbol "S"
+    inference_model.set_input_fact(0, "1,S,80,f32")?;
+    let mut model = inference_model.into_model()?;
+    ```
+  </Step>
+
+  <Step title="Apply the Pulse transform">
+    Pass a pulse size and the name of the streaming symbol to `Pulse::new`. The pulse size is the number of time steps processed per call.
+
+    <Tabs>
+      <Tab title="Rust">
+        ```rust
+        use tract::prelude::*;
+
+        model.transform(Pulse::new("512").symbol("S"))?;
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import tract
+
+        model.transform(tract.Pulse("512", symbol="S"))
+        ```
+      </Tab>
+    </Tabs>
+
+    Choose the pulse size based on your latency budget and model receptive field. Smaller pulses reduce latency; larger pulses improve throughput.
+  </Step>
+
+  <Step title="Make the model runnable">
+    <Tabs>
+      <Tab title="Rust">
+        ```rust
+        let runnable = model.into_runnable()?;
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        runnable = model.into_runnable()
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Spawn a state and process frames">
+    Create a `State` from the `Runnable`. The state owns the delay buffers and hidden activations. Call `state.run()` once per incoming pulse.
+
+    <Tabs>
+      <Tab title="Rust">
+        ```rust
+        use tract::prelude::*;
+
+        let mut state = runnable.spawn_state()?;
+
+        // Process an audio stream frame by frame
+        for frame in audio_stream.chunks(512) {
+            let input = tract_ndarray::Array3::from_shape_vec(
+                (1, 512, 80),
+                frame.to_vec(),
+            )?;
+            let output = state.run([input])?;
+            let score = output[0].as_slice::<f32>()?[0];
+            if score > 0.9 {
+                println!("wake word detected!");
+            }
+        }
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import tract, numpy
+
+        state = runnable.spawn_state()
+
+        for frame in audio_frames:
+            # frame shape: (1, 512, 80)
+            output = state.run([frame])
+            score = output[0].to_numpy()[0, 0]
+            if score > 0.9:
+                print("wake word detected!")
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
+
+## Serializing pulsed models to NNEF
+
+Pulsed models can be serialized to NNEF with the pulse extension, avoiding the cost of re-running the Pulse transform at every startup.
+
+```bash
+# Offline: convert to NNEF with pulse extension
+tract wake_word.onnx -i 1,S,80,f32 pulse 512 nnef -o wake_word_pulsed.nnef.tgz
+```
+
+At runtime, enable the pulse extension when loading:
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let mut nnef = tract::nnef()?;
+    nnef.enable_pulse()?;
+
+    let runnable = nnef
+        .load("wake_word_pulsed.nnef.tgz")?
+        .into_runnable()?;
+
+    let mut state = runnable.spawn_state()?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+
+    runnable = (
+        tract.nnef()
+        .with_pulse()
+        .load("wake_word_pulsed.nnef.tgz")
+        .into_runnable()
+    )
+
+    state = runnable.spawn_state()
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  `tract-pulse-opl` is the minimal crate needed to *run* a pre-pulsified NNEF model at inference time. The heavier `tract-pulse` crate (which contains the transform logic) is only needed during the offline conversion step.
+</Tip>
+
+## Multiple concurrent streams
+
+Each `spawn_state()` call creates an independent state. Run as many concurrent streams as needed from a single `Runnable`:
+
+```rust
+let runnable = Arc::new(runnable);
+
+let handles: Vec<_> = microphones
+    .into_iter()
+    .map(|mic| {
+        let r = Arc::clone(&runnable);
+        std::thread::spawn(move || {
+            let mut state = r.spawn_state().unwrap();
+            for frame in mic {
+                state.run([frame]).unwrap();
+            }
+        })
+    })
+    .collect();
+```
+
+## Tips and common pitfalls
+
+<AccordionGroup>
+  <Accordion title="Set input facts before pulsing">
+    The Pulse transform requires all tensor shapes to be known (except for the streaming axis). Apply `set_input_fact` on the `InferenceModel` before calling `into_model()`, or verify that the ONNX file already carries shape information.
+  </Accordion>
+  <Accordion title="The model must be RNN or causal CNN">
+    Bidirectional models, attention with full-sequence context, and any layer that aggregates over the entire sequence cannot be pulsed. Causal convolutions and unidirectional RNNs (LSTM, GRU) work well.
+  </Accordion>
+  <Accordion title="Output latency">
+    The pulsed model introduces a latency equal to the model's receptive field. The first few output frames may be zero-padded or reflect boundary conditions. Account for this initial delay in your pipeline.
+  </Accordion>
+  <Accordion title="Pulse size vs. receptive field">
+    The pulse size must be smaller than or equal to the model's total temporal receptive field for the streaming conversion to make sense. If the pulse size equals the full sequence length, you get no streaming benefit — the model just processes one fixed window.
+  </Accordion>
+</AccordionGroup>

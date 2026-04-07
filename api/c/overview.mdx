@@ -1,0 +1,114 @@
+---
+title: "C API overview"
+description: "Using tract from C via the FFI bindings"
+---
+
+The tract C API (`tract-ffi`) exposes a stable C ABI so you can use tract from C, C++, or any language with C FFI support.
+
+<Note>
+The Rust and Python APIs are higher-level and easier to use. Consider the C API when you need to integrate tract into an existing C/C++ codebase or a language without Rust/Python bindings.
+</Note>
+
+## Setup
+
+Include the generated header and link against the tract FFI library:
+
+```c
+#include "tract.h"
+// Compile with: -ltract_ffi
+```
+
+The header is generated from the `tract-ffi` crate. Prebuilt binaries for common platforms are available on [GitHub Releases](https://github.com/sonos/tract/releases).
+
+## Conventions
+
+**Naming:** All types are prefixed with `Tract` (e.g., `TractNnef`, `TractModel`). All functions are prefixed with `tract_` (e.g., `tract_nnef_create`).
+
+**Error handling:** Every function returns `TRACT_RESULT`. Check for `TRACT_RESULT_KO` and call `tract_get_last_error()` to retrieve the error message:
+
+```c
+#define check(call) { \
+    TRACT_RESULT result = call; \
+    if (result == TRACT_RESULT_KO) { \
+        fprintf(stderr, "tract error: %s\n", tract_get_last_error()); \
+        exit(1); \
+    } \
+}
+```
+
+**Ownership:** tract uses explicit destroy functions. When you call a function that produces an object (e.g., `tract_nnef_create`), you own it and must destroy it. Some functions (like `tract_runtime_prepare`) consume and NULL-out their input pointer.
+
+## Complete example
+
+Load and run a MobileNet v2 model (from `api/c/mobilenet.c`):
+
+```c mobilenet.c
+#include "tract.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    // Create NNEF parser
+    TractNnef *nnef = NULL;
+    check(tract_nnef_create(&nnef));
+
+    // Load model — nnef is still valid after this
+    TractModel *model = NULL;
+    check(tract_nnef_load(nnef, "mobilenet_v2_1.0.onnx.nnef.tgz", &model));
+    check(tract_nnef_destroy(&nnef));  // no longer needed
+
+    // Pick the default (CPU) runtime and prepare runnable
+    TractRuntime *runtime = NULL;
+    check(tract_runtime_for_name("default", &runtime));
+
+    // prepare() consumes model and NULLs it out
+    TractRunnable *runnable = NULL;
+    check(tract_runtime_prepare(runtime, &model, &runnable));
+
+    // Build input tensor
+    float *image = malloc(3 * 224 * 224 * sizeof(float));
+    FILE *fd = fopen("grace_hopper_3_224_224.f32.raw", "rb");
+    fread(image, sizeof(float), 3 * 224 * 224, fd);
+    fclose(fd);
+
+    TractTensor *input = NULL;
+    size_t shape[] = {1, 3, 224, 224};
+    check(tract_tensor_from_bytes(TRACT_DATUM_TYPE_F32, 4, shape, image, &input));
+    free(image);
+
+    // Stateless run
+    TractTensor *output = NULL;
+    check(tract_runnable_run(runnable, &input, &output));
+
+    // Read results
+    const float *data = NULL;
+    check(tract_tensor_as_bytes(output, NULL, NULL, NULL, (const void **)&data));
+
+    float max = data[0];
+    int argmax = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (data[i] > max) { max = data[i]; argmax = i; }
+    }
+    printf("Class %d (score: %f)\n", argmax, max);
+
+    // Cleanup
+    check(tract_tensor_destroy(&output));
+    check(tract_tensor_destroy(&input));
+    check(tract_runnable_release(&runnable));
+    return 0;
+}
+```
+
+## Key types
+
+| Type | Description |
+|------|-------------|
+| `TractNnef` | NNEF parser/serializer |
+| `TractOnnx` | ONNX parser |
+| `TractModel` | Typed model (before optimization) |
+| `TractRuntime` | Compute backend (CPU, CUDA, Metal) |
+| `TractRunnable` | Optimized, ready-to-run model |
+| `TractState` | Stateful session (for RNNs/streaming) |
+| `TractTensor` | N-dimensional data array |
+
+See the [C API reference](/api/c/reference) for the full function listing.

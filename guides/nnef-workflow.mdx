@@ -1,0 +1,178 @@
+---
+title: "NNEF workflow"
+description: "Convert models to NNEF for lighter, faster production deployments."
+---
+
+NNEF (Neural Network Exchange Format) is a format designed for *inference* rather than training. Compared to ONNX or a TensorFlow frozen model, a NNEF archive:
+
+- loads significantly faster at startup (no heavy translation or decluttering pass)
+- has a smaller runtime dependency footprint (no `tract-onnx` or `tract-tensorflow` needed)
+- is machine-independent — the same `.nnef.tgz` file works on any architecture
+
+The typical workflow is a **one-time offline conversion** followed by a **lightweight runtime load**.
+
+## The two-step workflow
+
+<Steps>
+  <Step title="Convert once (offline)">
+    Use the `tract` CLI to load your ONNX or TensorFlow model, optimize it, and serialize to NNEF. Install the CLI with:
+
+    ```bash
+    cargo install tract
+    ```
+
+    Then convert:
+
+    ```bash
+    tract model.onnx -O -i 1,3,224,224,f32 nnef -o model.nnef.tgz
+    ```
+
+    Flags:
+    - `-O` — run the full optimization pass before serializing
+    - `-i 1,3,224,224,f32` — provide the input shape and dtype (required when the ONNX file omits it)
+    - `nnef -o model.nnef.tgz` — write a gzip-compressed NNEF tar archive
+
+    To write an uncompressed directory instead:
+
+    ```bash
+    tract model.onnx -O -i 1,3,224,224,f32 nnef -o model.nnef
+    ```
+  </Step>
+
+  <Step title="Load at runtime">
+    At application start, load the pre-converted NNEF archive. No ONNX parsing, no decluttering — just format deserialization and a lightweight optimization step.
+
+    <Tabs>
+      <Tab title="Rust">
+        ```rust
+        use tract::prelude::*;
+
+        let model = tract::nnef()?
+            .load("model.nnef.tgz")?
+            .into_runnable()?;
+
+        let result = model.run([input])?;
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import tract
+
+        model = (
+            tract.nnef()
+            .load("model.nnef.tgz")
+            .into_runnable()
+        )
+
+        result = model.run([input_array])
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
+
+## tract-OPL extensions
+
+Standard NNEF does not cover all operators that tract supports. **tract-OPL** is a set of proprietary NNEF extensions that allows serializing and loading any model tract can handle.
+
+Extensions are opt-in and must be enabled on the `Nnef` context before loading a model that uses them.
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let mut nnef = tract::nnef()?;
+    nnef.enable_tract_core()?;   // tract-core operator extensions
+    nnef.enable_onnx()?;         // ONNX operators not in tract-core
+    nnef.enable_pulse()?;        // streaming/pulse operators
+
+    let model = nnef.load("model.nnef.tgz")?.into_runnable()?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+
+    nnef = (
+        tract.nnef()
+        .with_tract_core()
+        .with_onnx()
+        .with_pulse()
+    )
+
+    model = nnef.load("model.nnef.tgz").into_runnable()
+    ```
+  </Tab>
+</Tabs>
+
+Available extensions:
+
+| Method | What it enables |
+|---|---|
+| `enable_tract_core` / `with_tract_core` | Core tract operators not in the NNEF spec |
+| `enable_tract_extra` / `with_tract_extra` | Supplementary tract-extra operators |
+| `enable_tract_transformers` / `with_tract_transformers` | Transformer-specific operators (attention, etc.) |
+| `enable_onnx` / `with_onnx` | ONNX operators that have no tract-core equivalent |
+| `enable_pulse` / `with_pulse` | Pulse/streaming operators |
+| `enable_extended_identifier_syntax` | PyTorch 2-style path-like node identifiers |
+
+<Tip>
+  The CLI automatically enables the appropriate extensions when it writes the file. If you load a model that was saved with the CLI, enable `tract_core` and, if the original was ONNX, `onnx` as well.
+</Tip>
+
+## Writing models back to NNEF
+
+You can save any `Model` (e.g. after applying transforms like `FloatPrecision`) back to NNEF from code:
+
+<Tabs>
+  <Tab title="Rust">
+    ```rust
+    use tract::prelude::*;
+
+    let nnef = tract::nnef()?;
+
+    // Compressed archive (.nnef.tgz) — recommended for production
+    nnef.write_model_to_tar_gz("output.nnef.tgz", &model)?;
+
+    // Uncompressed tar
+    nnef.write_model_to_tar("output.nnef.tar", &model)?;
+
+    // Unpacked directory
+    nnef.write_model_to_dir("output_dir/", &model)?;
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import tract
+
+    nnef = tract.nnef()
+
+    # Compressed archive
+    nnef.write_model_to_tar_gz(model, "output.nnef.tgz")
+
+    # Uncompressed tar
+    nnef.write_model_to_tar(model, "output.nnef.tar")
+
+    # Directory
+    nnef.write_model_to_dir(model, "output_dir/")
+    ```
+  </Tab>
+</Tabs>
+
+## Version compatibility
+
+<Info>
+  **Golden rule:** models serialized with tract `0.x.y` are guaranteed to load with tract `0.x.z` where `z ≥ y`.
+
+  Starting from `0.17.0`, tract injects a `tract_nnef_ser_version` property into every saved file. You can read it at runtime with `model.property("tract_nnef_ser_version")` to decide whether a re-conversion is needed.
+</Info>
+
+Notable breaking changes in the past:
+
+- **0.16.3** — forward-compatible change to the `Scan` operator serialization
+- **0.17.0** — binary decision tree classifier format changed
+
+<Warning>
+  There is no automatic version check at load time. If your application requires strict version guarantees, inspect `tract_nnef_ser_version` at startup and regenerate the NNEF archive when tract is updated.
+</Warning>

@@ -1,0 +1,118 @@
+---
+title: "CLI overview"
+description: "The tract command-line tool for inspecting, converting, and benchmarking models"
+---
+
+The `tract` CLI is an auditing, debugging, and profiling tool for neural network models. It is designed for interactive exploration and CI pipelines, not for production inference — use the Rust API for that.
+
+<Warning>
+  The text output format of `tract` is not stable and should not be parsed by scripts. Use `--json` when you need machine-readable output.
+</Warning>
+
+## Install
+
+<Steps>
+  <Step title="Build from crates.io">
+    Install the latest published release with Cargo:
+
+    ```bash
+    cargo install tract
+    ```
+  </Step>
+  <Step title="Download a prebuilt binary">
+    Prebuilt binaries for macOS (Intel), Linux (x86-64), Armv7, and Armv8 are available on the GitHub releases page:
+
+    ```
+    https://github.com/sonos/tract/releases/latest
+    ```
+  </Step>
+  <Step title="Run from source">
+    Clone the repository and run directly:
+
+    ```bash
+    git clone https://github.com/sonos/tract
+    cd tract/cli
+    cargo run -- --help
+    ```
+  </Step>
+</Steps>
+
+## Basic usage
+
+```bash
+tract [OPTIONS] <model-file> [SUBCOMMAND]
+```
+
+When no subcommand is given, `tract` defaults to `dump`.
+
+```bash
+tract mobilenetv2-7.onnx -i 1,3,224,224,f32
+# equivalent to:
+tract mobilenetv2-7.onnx -i 1,3,224,224,f32 dump
+```
+
+## Key flags
+
+| Flag | Description |
+|---|---|
+| `-i <shape>` | Set input shape and type, e.g. `1,3,224,224,f32` |
+| `-O` | Apply optimizations (`into_optimized`) before the subcommand |
+| `--pass <stage>` | Stop the loading pipeline at a named stage |
+| `-v` | Increase verbosity (repeat for more: `-vv`, `-vvv`) |
+| `-f <format>` | Hint the model format: `onnx`, `nnef`, `tflite`, or `tf` |
+| `--json` | Emit machine-readable JSON output |
+| `-t / --transform <name>` | Apply a named model transform before running |
+| `--pulse <N>` | Translate to a pulsed (streaming) network |
+| `--threads <N>` | Set the size of the compute thread pool (0 = physical cores) |
+
+### Input shape syntax
+
+The `-i` flag accepts a comma-separated shape followed by a data type suffix:
+
+```
+1,3,224,224,f32   → batch=1, channels=3, height=224, width=224, dtype=float32
+1,S,i64           → batch=1, sequence length S (symbolic), dtype=int64
+```
+
+Supported dtype suffixes: `f16`, `f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`.
+
+## Available subcommands
+
+<CardGroup cols={2}>
+  <Card title="dump" icon="list-tree">
+    Display the model graph in tract-OPL form. The default when no subcommand is provided.
+  </Card>
+  <Card title="bench" icon="timer">
+    Benchmark inference latency using a built-in timing harness.
+  </Card>
+  <Card title="criterion" icon="chart-bar">
+    Benchmark using the [`criterion`](https://docs.rs/criterion) crate for rigorous statistical measurement.
+  </Card>
+  <Card title="run" icon="play">
+    Run the model on real input data, optionally loading inputs from an `.npz` bundle and asserting outputs match expected values.
+  </Card>
+  <Card title="compare" icon="arrows-left-right">
+    Compare tract's output against a reference (another pipeline stage, TensorFlow, or a `.npz` file).
+  </Card>
+  <Card title="list-ops" icon="code">
+    List all operators registered in the loaded frameworks (ONNX, TensorFlow).
+  </Card>
+</CardGroup>
+
+## Pipeline stages
+
+The `--pass <stage>` flag stops the model loading pipeline at the named stage. Use this to inspect models at early or intermediate points before full decluttering or optimization.
+
+```bash
+# Inspect the model immediately after loading (no type inference)
+tract mobilenetv2-7.onnx --pass load dump
+
+# Inspect after shape/type analysis but before decluttering
+tract mobilenetv2-7.onnx -i 1,3,224,224,f32 --pass analyse dump
+```
+
+The full sequence of stages is: `load` → `analyse` → `incorporate` → `type` → `declutter` → `before-optimize` → `optimize`.
+
+<Tip>
+  `--pass load` and `--pass analyse` are particularly useful when you need to inspect a model whose input types are unknown, since they skip the steps that require complete type information.
+</Tip>
